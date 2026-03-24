@@ -4,11 +4,12 @@ from pathlib import Path
 
 import networkx as nx
 
-from odev.common import args
+from odev.common import args, bash, progress
 from odev.common.commands import DatabaseCommand
+from odev.common.connectors import GitConnector
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
-from odev.common.odoobin import OdoobinProcess
+from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
 
@@ -42,16 +43,22 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         description="The target Odoo version. Defaults to the environment's target version.",
     )
 
-    no_verify = args.Flag(
-        aliases=["--no-verify"],
-        description="Disable automatic file verification (lxml/ruff) after edits.",
-        default=False,
-    )
-
     comment = args.String(
         aliases=["-c", "--comment"],
         description="Add a custom comment/instruction to the AI prompt.",
         default="",
+    )
+
+    submodules = args.Flag(
+        aliases=["--submodules"],
+        description="Look for modules in git submodules (default: False).",
+        default=False,
+    )
+
+    no_pre_commit = args.Flag(
+        aliases=["--no-pre-commit"],
+        description="Disable automatic pre-commit checks and fixes before upgrading.",
+        default=False,
     )
 
     @property
@@ -150,11 +157,43 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         else:
             search_paths.append(self.args.path)
 
+        if self.args.submodules:
+            try:
+                from git import Repo
+
+                repo = Repo(self.args.path, search_parent_directories=True)
+                for submodule in repo.submodules:
+                    sm_path = Path(repo.working_dir) / submodule.path
+                    if sm_path not in search_paths:
+                        search_paths.append(sm_path)
+            except Exception as e:
+                logger.warning(f"Could not find submodules in {self.args.path}: {e}")
+
         modules_info = self._get_sorted_modules(search_paths)
 
         if not modules_info:
             logger.error(f"No modules found in search paths: {[str(p) for p in search_paths]}")
             return None
+
+        # Manage Odoo Upgrade (migration scripts) repository
+        upgrade_repo_added = False
+        upgrade_path = self.config.paths.upgrade
+        upgrade_instructions = ""
+
+        upgrade_connector = GitConnector(ODOO_UPGRADE_REPOSITORY, path=upgrade_path)
+        with progress.spinner(f"Managing {ODOO_UPGRADE_REPOSITORY!r} repository"):
+            if not upgrade_connector.exists:
+                upgrade_connector.clone()
+            else:
+                upgrade_connector.pull(force=True)
+            upgrade_repo_added = True
+
+        upgrade_instructions = (
+            f"\n- **Migration Scripts (Upgrade Repository)**: You have access to the official Odoo Enterprise migration scripts at `{upgrade_path.as_posix()}`. "
+            "This repository contains the logic used by Odoo's upgrade team. "
+            "You MUST search this directory to understand how Odoo handles API changes, field renames, and model migrations for the modules you are upgrading. "
+            "Use `grep` or `git grep` within this directory to find mentions of your module or specific fields/methods that have changed."
+        )
 
         # Load existing report or create a new one
         report_path = self.args.path / "UPGRADE.md"
@@ -178,19 +217,35 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         except Exception:
             target_odoo_path = "Unknown (not yet created/cloned)"
 
-        # Prepare environment
-        logger.info(f"Preparing environment for Odoo {target_ver}...")
+        # Prepare environments
+        if from_ver != target_ver:
+            logger.info(f"Preparing environment for Odoo {from_ver} (source)...")
+            self.odev.run_command("pull", "-V", from_ver)
+            self.odev.run_command("worktree", "-C", from_ver, "-V", from_ver)
+
+        logger.info(f"Preparing environment for Odoo {target_ver} (target)...")
         self.odev.run_command("pull", "-V", target_ver)
         self.odev.run_command("worktree", "-C", target_ver, "-V", target_ver)
+
+        # Re-resolve paths after preparation
+        try:
+            from_odoo_path = from_odoobin.odoo_path.as_posix()
+        except Exception:
+            pass
+
+        try:
+            target_odoo_path = target_odoobin.odoo_path.as_posix()
+        except Exception:
+            pass
 
         # Prepare module context for AI
         modules_list_str = "\n".join(
             [f"- {m['name']} (Path: {m['path']}, Depends: {', '.join(m['depends'])})" for m in modules_info]
         )
 
-        verify_instructions = ""
-        if not self.args.no_verify:
-            verify_instructions = "\n- **File Verification**: After editing any Python or XML file, you MUST verify it using `ruff check <file>` (for Python) or `lxml`/`xmllint` (for XML) to ensure no syntax errors."
+        pre_commit_instructions = ""
+        if not self.args.no_pre_commit:
+            pre_commit_instructions = "\n- **Pre-commit**: I have already applied some pre-commit fixes. Before finishing, you SHOULD run `pre-commit run --all-files` to ensure all rules are respected."
 
         repo_name = self.args.path.resolve().name
         is_ps_custom_external = repo_name.startswith("ps") and repo_name.endswith("-custom")
@@ -216,27 +271,52 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 1. **Analyze & Plan**: First, analyze the modules and their dependencies. **Describe your plan in the chat**, and then create (or update) a `TASKS.md` file in the root directory with a detailed checklist of your planned steps.
 2. **Execution & Fast Verification**: For each module (in dependency order):
    - **Update `TASKS.md`**: Mark items as `[/]` (in progress) or `[x]` (completed).
-   - **Upgrade the code**: Upgrade models, views, and data files.
-     - **Tip**: You can use `git log`, `git diff`, or `git blame` in the Target or Source Odoo repository to understand API changes and why core code was modified.
+
+   - **CRITICAL MANDATE: No Action Without Proof**:
+     You are strictly forbidden from modifying any Odoo API calls, view structures, or field names based on your internal knowledge or memory. Before you change any Odoo-specific code, you MUST find the exact commit hash or file change in the Target Odoo repository that proves the new implementation.
+
+   - **Safe Git Research Workflow**:
+     When researching changes, use these context-safe commands:
+     - To find when a field/method was changed/removed: `git log -S "term" --oneline -n 5`
+     - To find current API usage/definitions: `git grep -C 3 "term" odoo/addons/base`
+     - To see how a core module migrated a specific file: `git log -p -1 -- <path_to_core_file>`
+     Always run these inside the Target Odoo repository (`{target_odoobin.odoo_path.as_posix()}`).
+
+   - **Evidence-Based Execution**:
+     Before calling the `replace` or `write_file` tool to fix an Odoo version incompatibility, you MUST explicitly state the following in your chat message:
+     1. The exact file and line number in the Odoo Core target repository that proves the new syntax.
+     2. The Git commit hash (if found) that introduced the change.
+     Only after stating this evidence are you permitted to modify the file.
+
+   - **Upgrade the code**: Upgrade models, views, and data files.{upgrade_instructions}
+
    - **Data Migrations**: If your code changes involve structural modifications (e.g., field renames, moving fields to another model, renaming models, or model merges), **you MUST create migration scripts** to prevent data loss.
      - **MANDATORY**: Moving fields/data between models (like `stock.valuation.layer` to `stock.move`) is a destructive operation without a script.
+
    - **Use Upgrade Utils**: When writing migration scripts, use Odoo's Upgrade Utils (`util.py`). Refer to [Odoo Upgrade Utils](https://www.odoo.com/documentation/18.0/th/developer/reference/upgrades/upgrade_utils.html).
+
    - **Migration Files**: Place scripts in `<module>/migrations/{target_ver}/` as `pre-migration.py`, `post-migration.py`, or `end-migration.py`.
+
    {fast_verify}
+
+   - **Log Verification**: When running `odev`, you MUST check the output/logs for any errors, warnings, or tracebacks. Do NOT assume success if the command finishes.
    - **DO NOT** run `odev test` at this stage as it is too slow for individual iterations.
+
 3. **Global Verification (Final Step)**: Once ALL modules in your plan are upgraded and install cleanly, run the full test suite for the entire project: `odev test --no-pretty --log-level=warn {target_db} -i <comma_separated_modules>`.
-4. **Report Progress**: Update the `UPGRADE.md` file after each module and after the final verification.
-   - **Structure**: Format the report nicely using well-organized sections, sub-lists, and markdown features for better readability.
-   - **Sources**: For every single change, you MUST explicitly include the upstream source of the API/behavior change (e.g., the exact Odoo Community or Enterprise commit hash/reference that forced this adaptation).
-   - **IMPORTANT**: In `UPGRADE.md`, document both the local file modified and the *reason* for the change (e.g., "Updated method signature in `models/my_model.py` because commit `abc1234` in `odoo/odoo` changed the API in {target_ver}").
-- **Version Upgrades**: The upgraded module version MUST follow the format: `MAJOR_ODOO.MINOR_ODOO.MAJOR_MODULE.MINOR_MODULE.PATCH_MODULE` (e.g., `{target_ver}.1.0.0`).
-  - When upgrading to a new major Odoo version, the module part of the version MUST start at `1.0.0`.
+   - **Tour Tests**: To verify that the UI works correctly in the browser, you SHOULD add or run Odoo tours. If the module is complex, create a new tour in `static/tests/tours/` and a corresponding Python test in `tests/` to trigger it. Run tours using: `odev test --log-level=warn --no-pretty {target_db} -t /<module_name>`.
+
+4. **Detailed Reporting**: Update the `UPGRADE.md` file after each module and after the final verification.
+   - **Reporting Structure**: For each module, you must provide a detailed list of changes:
+     - **Odoo API/Structural Upgrades**: You MUST include the exact file path in the Odoo target repository and the Git commit hash (or core file reference) that dictated the change.
+   - **Source Requirement**: Every single Odoo-specific change MUST have a specific "Source". If no commit is found, state: "Verified against Odoo core version {target_ver} file <path/to/core/file>".
+
+- **Version Upgrades**: The upgraded module version MUST follow the format: `MAJOR_ODOO.MINOR_ODOO.MAJOR_MODULE.0.0` (e.g., `{target_ver}.1.0.0`).
 
 ### Mandatory Rules:
-- **ALWAYS** use the `--no-pretty` flag (placed **before** the database name) with every `odev` command (create, run, test, venv).
+- **ALWAYS** use the `--no-pretty` flag (placed **before** the database name) with every `odev` command (create, run, test).
 - **MANDATORY**: When using `odev create`, you MUST ALWAYS specify the Odoo version with `-V <version>` AND use `--no-pretty` before the database name.
   - **Correct Example**: `odev create -V {target_ver} --no-pretty {target_db}`
-- If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `task.md` frequently.{verify_instructions}
+- If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `TASKS.md` frequently.{pre_commit_instructions}
 - **Strictly Upgrade Only**: DO NOT rewrite, refactor, or change functionality of code or views (e.g., do not add new attributes like `invisible` "for a professional touch"). Your sole task is making the module compatible with the target version.
 - **Maintain Feature Coverage**: If a feature or piece of code is broken during the upgrade, **DO NOT** simply remove it. You must maintain the same feature coverage by either replacing it with a new implementation compatible with {target_ver} or by implementing a workaround.
 - **Delegate Heavy Tasks**: If your CLI supports sub-agents or delegation tools (like `generalist`), use them to parallelize or offload heavy analysis, repetitive editing, or complex research tasks.
@@ -251,22 +331,71 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             sandbox_dirs.append(from_odoo_path)
         if target_odoo_path and "Unknown" not in target_odoo_path:
             sandbox_dirs.append(target_odoo_path)
+        if upgrade_repo_added:
+            sandbox_dirs.append(str(upgrade_path.resolve()))
 
         return prompt, sandbox_dirs, from_ver, target_ver, target_db
 
     def _run_upgrade(self) -> None:
         """Internal logic for the upgrade process."""
+        # Git safety checks
+        repo_path = self.args.path.resolve()
+        connector = GitConnector(str(repo_path))
+        if connector.exists:
+            if connector.is_protected_branch:
+                raise self.error(
+                    f"Repository at {repo_path} is on a protected branch ({connector.branch!r}). "
+                    "AI upgrades should be performed on a feature branch."
+                )
+            if connector.is_dirty:
+                raise self.error(
+                    f"Repository at {repo_path} has uncommitted changes. "
+                    "Please commit or stash your changes before proceeding."
+                )
+
         prepared = self._prepare_upgrade()
         if not prepared:
             return
 
         prompt, sandbox_dirs, from_ver, target_ver, target_db = prepared
 
+        # Pre-upgrade pre-commit check
+        if not self.args.no_pre_commit:
+            repo_path = self.args.path.resolve()
+            if (repo_path / ".git").exists():
+                logger.info(f"Running pre-commit checks on {repo_path}...")
+                try:
+                    # 1. Setup/Update pre-commit config
+                    # We use --yes to bypass prompts in odev pre-commit (if it supports it)
+                    # or at least we try to run it.
+                    self.odev.run_command("pre-commit", str(repo_path), "--force")
+
+                    # 2. Run pre-commit hooks to apply fixes
+                    try:
+                        # Use run() instead of execute() to show output in real-time
+                        bash.run(f"cd {repo_path} && pre-commit run --all-files")
+                    except bash.CalledProcessError:
+                        # pre-commit returns 1 when it modifies files, which is expected
+                        pass
+
+                    # 3. Commit fixes if any
+                    repo = GitConnector(repo_path).repository
+                    if repo and repo.is_dirty(untracked_files=True):
+                        repo.git.add(A=True)
+                        repo.git.commit(
+                            "-m",
+                            "refactor: apply pre-commit fixes before AI upgrade",
+                            no_verify=True,
+                        )
+                        logger.info("Committed pre-commit fixes.")
+                except Exception as e:
+                    logger.warning(f"Failed to run pre-commit: {e}")
+
         agent = self.get_ai_agent()
 
         try:
             logger.info("=" * 60)
-            logger.info(f"Starting Project-wide AI Upgrade using {self.args.cli}")
+            logger.info(f"Starting Project-wide AI Upgrade using {self.args.cli or self.config.ai.favorite_cli}")
             logger.info(f"From {from_ver} to {target_ver} (Target DB: {target_db})")
             logger.info("=" * 60)
 

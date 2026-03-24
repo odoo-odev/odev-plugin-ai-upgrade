@@ -35,4 +35,4 @@ __version__ = "1.1.0"
 # All plugins depend from odev core by default.
 # ------------------------------------------------------------------------------
 
-depends = ["odoo-odev/odev-plugin-ai"]
+depends = ["odoo-odev/odev-plugin-ai", "odoo-odev/odev-plugin-project"]
