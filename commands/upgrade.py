@@ -4,7 +4,7 @@ from pathlib import Path
 
 import networkx as nx
 
-from odev.common import args, bash, progress
+from odev.common import args, progress
 from odev.common.commands import DatabaseCommand
 from odev.common.connectors import GitConnector
 from odev.common.logging import logging
@@ -55,10 +55,10 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         default=False,
     )
 
-    no_pre_commit = args.Flag(
-        aliases=["--no-pre-commit"],
-        description="Disable automatic pre-commit checks and fixes before upgrading.",
-        default=False,
+    resume = args.String(
+        aliases=["--resume"],
+        description="Resume a previous AI session by ID or 'latest'.",
+        default=None,
     )
 
     @property
@@ -118,7 +118,43 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         except KeyboardInterrupt:
             logger.warning("\nUpgrade interrupted by user.")
         finally:
+            self._update_upgrade_report_with_session()
             self._cleanup_wizard(stage="post-flight")
+
+    def _update_upgrade_report_with_session(self) -> None:
+        """Update UPGRADE.md with information on how to resume the session."""
+        report_path = self.args.path / "UPGRADE.md"
+        if not report_path.exists():
+            return
+
+        agent = self.get_ai_agent()
+        session_id = self.args.resume or "latest"
+
+        # Try to find the actual latest session ID if we didn't provide one
+        if session_id == "latest":
+            actual_id = agent.get_latest_session_id()
+            if actual_id:
+                session_id = actual_id
+
+        resume_cmd = f"odev upgrade --resume {session_id}"
+        if self.args.target_version:
+            resume_cmd += f" --target-version {self.args.target_version}"
+        if self.args.module_name:
+            resume_cmd += f" {self.args.module_name}"
+
+        content = report_path.read_text()
+        resume_section = f"\n\n### Resume Session\nTo resume this upgrade session, run:\n```bash\n{resume_cmd}\n```\n"
+
+        if "### Resume Session" in content:
+            # Update existing section
+            import re
+
+            content = re.sub(r"### Resume Session.*?(?=\n\n|$)", resume_section.strip(), content, flags=re.DOTALL)
+        else:
+            content += resume_section
+
+        report_path.write_text(content)
+        logger.info(f"Updated {report_path.name} with resume instructions.")
 
     def _prepare_upgrade(self) -> tuple[str, list[str], str, str, str] | None:
         """Prepare the upgrade environment and generate the AI prompt."""
@@ -218,14 +254,11 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             target_odoo_path = "Unknown (not yet created/cloned)"
 
         # Prepare environments
-        if from_ver != target_ver:
-            logger.info(f"Preparing environment for Odoo {from_ver} (source)...")
-            self.odev.run_command("pull", "-V", from_ver)
-            self.odev.run_command("worktree", "-C", from_ver, "-V", from_ver)
-
-        logger.info(f"Preparing environment for Odoo {target_ver} (target)...")
-        self.odev.run_command("pull", "-V", target_ver)
-        self.odev.run_command("worktree", "-C", target_ver, "-V", target_ver)
+        for version in sorted({from_ver, target_ver}):
+            logger.info(f"Preparing environment for Odoo {version}...")
+            if not (self.odev.worktrees_path / version).exists():
+                self.odev.run_command("worktree", "-C", version, "-V", version)
+            self.odev.run_command("pull", "-V", version)
 
         # Re-resolve paths after preparation
         try:
@@ -243,17 +276,13 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             [f"- {m['name']} (Path: {m['path']}, Depends: {', '.join(m['depends'])})" for m in modules_info]
         )
 
-        pre_commit_instructions = ""
-        if not self.args.no_pre_commit:
-            pre_commit_instructions = "\n- **Pre-commit**: I have already applied some pre-commit fixes. Before finishing, you SHOULD run `pre-commit run --all-files` to ensure all rules are respected."
-
-        repo_name = self.args.path.resolve().name
+        repo_name = Path(self.args.path).resolve().name
         is_ps_custom_external = repo_name.startswith("ps") and repo_name.endswith("-custom")
 
         if is_ps_custom_external:
             fast_verify = "- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`)."
         else:
-            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly using: `odev run --no-pretty --log-level=warn {target_db} -i <module_name> --stop-after-init`."
+            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run --no-pretty --log-level=warn {target_db} -i <module_name> --stop-after-init --install-demo`."
 
         prompt = f"""You are an expert Odoo Upgrade Lead. Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
 
@@ -276,10 +305,13 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
      You are strictly forbidden from modifying any Odoo API calls, view structures, or field names based on your internal knowledge or memory. Before you change any Odoo-specific code, you MUST find the exact commit hash or file change in the Target Odoo repository that proves the new implementation.
 
    - **Safe Git Research Workflow**:
-     When researching changes, use these context-safe commands:
-     - To find when a field/method was changed/removed: `git log -S "term" --oneline -n 5`
-     - To find current API usage/definitions: `git grep -C 3 "term" odoo/addons/base`
-     - To see how a core module migrated a specific file: `git log -p -1 -- <path_to_core_file>`
+     Before modifying Odoo core logic, research how it changed between {from_ver} and {target_ver}:
+     - **Trace Changes**: `git log {from_ver}..{target_ver} -- <file>` (List all commits touching a file between versions).
+     - **Identify Change**: `git blame -L <start>,<end> <file>` (Find which commit last modified specific lines).
+     - **Find Removed Code**: `git log -p -G "regex" -- <file>` (Search the history for the addition or removal of a specific code pattern).
+     - **Pickaxe Search**: `git log -S "term" --oneline -n 5` (Find commits where "term" appeared or disappeared).
+     - **Inspect Content**: `git show <commit_hash>` (See the full diff and message of a specific commit).
+     - **API usage**: `git grep -C 3 "term" odoo/addons/base`
      Always run these inside the Target Odoo repository (`{target_odoobin.odoo_path.as_posix()}`).
 
    - **Evidence-Based Execution**:
@@ -299,7 +331,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
    {fast_verify}
 
-   - **Log Verification**: When running `odev`, you MUST check the output/logs for any errors, warnings, or tracebacks. Do NOT assume success if the command finishes.
+   - **Log Verification**: When running execution or verification commands, you MUST inspect the full log output. A successful exit status does not guarantee that the Odoo registry loaded correctly. Explicitly check for `Registry` load failures, `TypeError`, or `AttributeError` which often indicate model-level incompatibilities.
+   - **Python API Compatibility**: For every module, systematically audit all overridden methods (especially those with signature changes like `read_group` or `search`) and `@api.depends` decorators against the Target Odoo source to ensure compatibility with the new API and available fields.
    - **DO NOT** run `odev test` at this stage as it is too slow for individual iterations.
 
 3. **Global Verification (Final Step)**: Once ALL modules in your plan are upgraded and install cleanly, run the full test suite for the entire project: `odev test --no-pretty --log-level=warn {target_db} -i <comma_separated_modules>`.
@@ -316,7 +349,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 - **ALWAYS** use the `--no-pretty` flag (placed **before** the database name) with every `odev` command (create, run, test).
 - **MANDATORY**: When using `odev create`, you MUST ALWAYS specify the Odoo version with `-V <version>` AND use `--no-pretty` before the database name.
   - **Correct Example**: `odev create -V {target_ver} --no-pretty {target_db}`
-- If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `TASKS.md` frequently.{pre_commit_instructions}
+- If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `TASKS.md` frequently.
 - **Strictly Upgrade Only**: DO NOT rewrite, refactor, or change functionality of code or views (e.g., do not add new attributes like `invisible` "for a professional touch"). Your sole task is making the module compatible with the target version.
 - **Maintain Feature Coverage**: If a feature or piece of code is broken during the upgrade, **DO NOT** simply remove it. You must maintain the same feature coverage by either replacing it with a new implementation compatible with {target_ver} or by implementing a workaround.
 - **Delegate Heavy Tasks**: If your CLI supports sub-agents or delegation tools (like `generalist`), use them to parallelize or offload heavy analysis, repetitive editing, or complex research tasks.
@@ -326,31 +359,26 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if self.args.comment:
             prompt += f"\n### Additional User Instructions:\n- {self.args.comment}\n"
 
-        sandbox_dirs = [str(self.args.path.resolve())]
+        sandbox_dirs = [str(Path(self.args.path).resolve())]
         if from_odoo_path and "Unknown" not in from_odoo_path:
             sandbox_dirs.append(from_odoo_path)
         if target_odoo_path and "Unknown" not in target_odoo_path:
             sandbox_dirs.append(target_odoo_path)
         if upgrade_repo_added:
-            sandbox_dirs.append(str(upgrade_path.resolve()))
+            sandbox_dirs.append(str(Path(upgrade_path).resolve()))
 
         return prompt, sandbox_dirs, from_ver, target_ver, target_db
 
     def _run_upgrade(self) -> None:
         """Internal logic for the upgrade process."""
         # Git safety checks
-        repo_path = self.args.path.resolve()
+        repo_path = Path(self.args.path).resolve()
         connector = GitConnector(str(repo_path))
         if connector.exists:
             if connector.is_protected_branch:
                 raise self.error(
                     f"Repository at {repo_path} is on a protected branch ({connector.branch!r}). "
                     "AI upgrades should be performed on a feature branch."
-                )
-            if connector.is_dirty:
-                raise self.error(
-                    f"Repository at {repo_path} has uncommitted changes. "
-                    "Please commit or stash your changes before proceeding."
                 )
 
         prepared = self._prepare_upgrade()
@@ -359,47 +387,21 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         prompt, sandbox_dirs, from_ver, target_ver, target_db = prepared
 
-        # Pre-upgrade pre-commit check
-        if not self.args.no_pre_commit:
-            repo_path = self.args.path.resolve()
-            if (repo_path / ".git").exists():
-                logger.info(f"Running pre-commit checks on {repo_path}...")
-                try:
-                    # 1. Setup/Update pre-commit config
-                    # We use --yes to bypass prompts in odev pre-commit (if it supports it)
-                    # or at least we try to run it.
-                    self.odev.run_command("pre-commit", str(repo_path), "--force")
-
-                    # 2. Run pre-commit hooks to apply fixes
-                    try:
-                        # Use run() instead of execute() to show output in real-time
-                        bash.run(f"cd {repo_path} && pre-commit run --all-files")
-                    except bash.CalledProcessError:
-                        # pre-commit returns 1 when it modifies files, which is expected
-                        pass
-
-                    # 3. Commit fixes if any
-                    repo = GitConnector(repo_path).repository
-                    if repo and repo.is_dirty(untracked_files=True):
-                        repo.git.add(A=True)
-                        repo.git.commit(
-                            "-m",
-                            "refactor: apply pre-commit fixes before AI upgrade",
-                            no_verify=True,
-                        )
-                        logger.info("Committed pre-commit fixes.")
-                except Exception as e:
-                    logger.warning(f"Failed to run pre-commit: {e}")
-
         agent = self.get_ai_agent()
 
         try:
-            logger.info("=" * 60)
-            logger.info(f"Starting Project-wide AI Upgrade using {self.args.cli or self.config.ai.favorite_cli}")
-            logger.info(f"From {from_ver} to {target_ver} (Target DB: {target_db})")
-            logger.info("=" * 60)
+            logger.info(
+                f"Starting Project-wide AI Upgrade ({self.args.cli or self.config.ai.favorite_cli}): "
+                f"from {from_ver} to {target_ver} (Target DB: {target_db})"
+            )
 
-            agent.run(prompt, sandbox_dirs, database=target_db, version=target_ver)
+            agent.run(
+                prompt,
+                sandbox_dirs,
+                database=target_db,
+                version=target_ver,
+                resume=self.args.resume,
+            )
 
         finally:
             logger.info("Finishing upgrade session.")
