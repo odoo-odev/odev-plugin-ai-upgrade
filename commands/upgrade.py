@@ -1,5 +1,6 @@
 """Upgrade Odoo modules using AI."""
 
+import socket
 from pathlib import Path
 
 import networkx as nx
@@ -38,9 +39,15 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         nargs="?",
     )
 
-    target_version = args.String(
-        aliases=["--target-version"],
+    to_version = args.String(
+        aliases=["--to-version"],
         description="The target Odoo version. Defaults to the environment's target version.",
+    )
+
+    from_version = args.String(
+        aliases=["--from-version"],
+        description="The source Odoo version. Overrides automatic detection from database or path.",
+        default=None,
     )
 
     comment = args.String(
@@ -111,6 +118,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         return [modules[name] for name in sorted_names if name in modules]
 
+    def _get_free_port(self) -> int:
+        """Find a free port on the host."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("", 0))
+            return s.getsockname()[1]
+
     def run(self) -> None:
         """Execute the upgrade command."""
         try:
@@ -118,47 +131,11 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         except KeyboardInterrupt:
             logger.warning("\nUpgrade interrupted by user.")
         finally:
-            self._update_upgrade_report_with_session()
             self._cleanup_wizard(stage="post-flight")
-
-    def _update_upgrade_report_with_session(self) -> None:
-        """Update UPGRADE.md with information on how to resume the session."""
-        report_path = self.args.path / "UPGRADE.md"
-        if not report_path.exists():
-            return
-
-        agent = self.get_ai_agent()
-        session_id = self.args.resume or "latest"
-
-        # Try to find the actual latest session ID if we didn't provide one
-        if session_id == "latest":
-            actual_id = agent.get_latest_session_id()
-            if actual_id:
-                session_id = actual_id
-
-        resume_cmd = f"odev upgrade --resume {session_id}"
-        if self.args.target_version:
-            resume_cmd += f" --target-version {self.args.target_version}"
-        if self.args.module_name:
-            resume_cmd += f" {self.args.module_name}"
-
-        content = report_path.read_text()
-        resume_section = f"\n\n### Resume Session\nTo resume this upgrade session, run:\n```bash\n{resume_cmd}\n```\n"
-
-        if "### Resume Session" in content:
-            # Update existing section
-            import re
-
-            content = re.sub(r"### Resume Session.*?(?=\n\n|$)", resume_section.strip(), content, flags=re.DOTALL)
-        else:
-            content += resume_section
-
-        report_path.write_text(content)
-        logger.info(f"Updated {report_path.name} with resume instructions.")
 
     def _prepare_upgrade(self) -> tuple[str, list[str], str, str, str] | None:
         """Prepare the upgrade environment and generate the AI prompt."""
-        from_ver = self._database.version
+        from_ver = self.args.from_version or self._database.version
         if not from_ver:
             # Try to detect version from the path if no database version is available
             from_ver = OdoobinProcess.version_from_manifest(self.args.path) or OdoobinProcess.version_from_addons(
@@ -175,9 +152,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         from_ver = str(from_ver)
 
-        target_ver = self.args.target_version or ""
+        target_ver = self.args.to_version or ""
         if not target_ver:
-            logger.error("Could not determine target version. Please specify a --target-version.")
+            logger.error("Could not determine target version. Please specify a --to-version.")
             return None
 
         base_db_name = (
@@ -233,10 +210,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         # Load existing report or create a new one
         report_path = self.args.path / "UPGRADE.md"
-        report_content = ""
-        if report_path.exists():
-            report_content = report_path.read_text()
-            logger.info(f"Loaded existing upgrade report from {report_path}")
+        report_exists = report_path.exists()
+        if report_exists:
+            logger.info(f"Existing upgrade report found at {report_path}")
 
         from odev.common.version import OdooVersion
 
@@ -279,30 +255,34 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         repo_name = Path(self.args.path).resolve().name
         is_ps_custom_external = repo_name.startswith("ps") and repo_name.endswith("-custom")
 
+        free_port = self._get_free_port()
+
         if is_ps_custom_external:
-            fast_verify = "- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`)."
+            fast_verify = f"- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`). Then, verify the presence of new fields or view rendering via a minimal test or manual check. You MUST use `--http-port {free_port}` if you launch Odoo."
         else:
-            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run --no-pretty --log-level=warn {target_db} -i <module_name> --stop-after-init --install-demo`."
+            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run --http-port {free_port} --log-level=warn {target_db} -i <module_name> without-demo=False`. Then, verify the presence of new fields, view rendering, or basic logic via a minimal test or tour."
 
         prompt = f"""You are an expert Odoo Upgrade Lead. Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
 
 ### Context:
 - **Source Odoo**: Version {from_ver} at `{from_odoo_path}` (Git repo).
 - **Target Odoo**: Version {target_ver} at `{target_odoo_path}` (Git repo).
+- **Project Root**: `{self.args.path.resolve().as_posix()}`
 - **Target Database**: `{target_db}` (Use this for all installations and tests).
 - **Modules to Upgrade**:
 {modules_list_str}
 
-### Existing Project Status (UPGRADE.md):
-{report_content or "No report found. This is a fresh start."}
+### Project Status:
+Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current progress and pending tasks.
+{"(Files found)" if report_exists else "(Fresh start: No existing reports found)"}
 
 ### Your Process:
 1. **Analyze & Plan**: First, analyze the modules and their dependencies. **Describe your plan in the chat**, and then create (or update) a `TASKS.md` file in the root directory with a detailed checklist of your planned steps.
 2. **Execution & Fast Verification**: For each module (in dependency order):
    - **Update `TASKS.md`**: Mark items as `[/]` (in progress) or `[x]` (completed).
 
-   - **CRITICAL MANDATE: No Action Without Proof**:
-     You are strictly forbidden from modifying any Odoo API calls, view structures, or field names based on your internal knowledge or memory. Before you change any Odoo-specific code, you MUST find the exact commit hash or file change in the Target Odoo repository that proves the new implementation.
+   - **Proactive Adaptation & Evidence-Based Action**:
+     While you should prioritize finding exact commit hashes or file changes in the Target Odoo repository, you are authorized to act based on explicit error logs, tracebacks, or logical comparisons between the old and new Odoo Core file structures. If a specific commit hash for 100% of the lines isn't found, use your best judgment based on the context of the Target Odoo source code.
 
    - **Safe Git Research Workflow**:
      Before modifying Odoo core logic, research how it changed between {from_ver} and {target_ver}:
@@ -314,13 +294,16 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
      - **API usage**: `git grep -C 3 "term" odoo/addons/base`
      Always run these inside the Target Odoo repository (`{target_odoobin.odoo_path.as_posix()}`).
 
-   - **Evidence-Based Execution**:
-     Before calling the `replace` or `write_file` tool to fix an Odoo version incompatibility, you MUST explicitly state the following in your chat message:
-     1. The exact file and line number in the Odoo Core target repository that proves the new syntax.
-     2. The Git commit hash (if found) that introduced the change.
-     Only after stating this evidence are you permitted to modify the file.
+   - **Empowered Expert Execution**:
+     You are an EXPERT Odoo Lead, not just a researcher. While evidence is preferred, you ARE authorized to act based on your expert understanding of Odoo {target_ver} standards and behavioral consistency.
+     If the Target Odoo source code shows a new pattern (e.g., JS concat, Kanban Card, new hooks), apply it proactively to our code even if you don't have a specific commit hash for that exact line.
+     Stating "Aligned with Odoo {target_ver} core logic and best practices" is sufficient justification for these technical modernizations.
 
-   - **Upgrade the code**: Upgrade models, views, and data files.{upgrade_instructions}
+   - **Modernization & Quality Audit**:
+     An upgrade is the best opportunity to reduce technical debt. You MUST prioritize REPLACING old custom patterns with the new, simpler standards seen in the Target Odoo {target_ver} repository.
+     If the Target Odoo Core version of a component is less complex or logically restructured, you SHOULD strive to REBASE our custom logic on that new standard instead of patching legacy code.
+
+   - **Upgrade the code**: Upgrade models, views, js, css, and data files.{upgrade_instructions}
 
    - **Data Migrations**: If your code changes involve structural modifications (e.g., field renames, moving fields to another model, renaming models, or model merges), **you MUST create migration scripts** to prevent data loss.
      - **MANDATORY**: Moving fields/data between models (like `stock.valuation.layer` to `stock.move`) is a destructive operation without a script.
@@ -332,11 +315,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
    {fast_verify}
 
    - **Log Verification**: When running execution or verification commands, you MUST inspect the full log output. A successful exit status does not guarantee that the Odoo registry loaded correctly. Explicitly check for `Registry` load failures, `TypeError`, or `AttributeError` which often indicate model-level incompatibilities.
-   - **Python API Compatibility**: For every module, systematically audit all overridden methods (especially those with signature changes like `read_group` or `search`) and `@api.depends` decorators against the Target Odoo source to ensure compatibility with the new API and available fields.
+   - **Recursive Audit**: You MUST perform a recursive audit of every file in the module, including `static/` JS files, templates (XML), and tours. Compare their implementation logic with equivalent or similar files in Odoo Core to ensure no functional breakage in "invisible" technical layers.
+   - **Python API Compatibility & "Broken Hooks"**: For every module, systematically audit all overridden methods (e.g., `read_group`, `search`, `name_get`). **Prioritize core models** like `stock.move`, `sale.order`, and `account.move`. Even if the signature appears unchanged, the internal calling logic in Odoo Core may have shifted, requiring adjustments in your inherited methods to ensure they are still triggered or behave correctly.
    - **DO NOT** run `odev test` at this stage as it is too slow for individual iterations.
 
-3. **Global Verification (Final Step)**: Once ALL modules in your plan are upgraded and install cleanly, run the full test suite for the entire project: `odev test --no-pretty --log-level=warn {target_db} -i <comma_separated_modules>`.
-   - **Tour Tests**: To verify that the UI works correctly in the browser, you SHOULD add or run Odoo tours. If the module is complex, create a new tour in `static/tests/tours/` and a corresponding Python test in `tests/` to trigger it. Run tours using: `odev test --log-level=warn --no-pretty {target_db} -t /<module_name>`.
+3. **Global Verification (Final Step)**: Once ALL modules in your plan are upgraded and install cleanly, run the full test suite for the entire project: `odev test --log-level=warn {target_db} -i <comma_separated_modules>`.
+   - **Tour Tests**: To verify that the UI works correctly in the browser, you SHOULD add or run Odoo tours. If the module is complex, create a new tour in `static/tests/tours/` and a corresponding Python test in `tests/` to trigger it. Run tours using: `odev test --log-level=warn {target_db} -t /<module_name>`.
 
 4. **Detailed Reporting**: Update the `UPGRADE.md` file after each module and after the final verification.
    - **Reporting Structure**: For each module, you must provide a detailed list of changes:
@@ -346,11 +330,10 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 - **Version Upgrades**: The upgraded module version MUST follow the format: `MAJOR_ODOO.MINOR_ODOO.MAJOR_MODULE.0.0` (e.g., `{target_ver}.1.0.0`).
 
 ### Mandatory Rules:
-- **ALWAYS** use the `--no-pretty` flag (placed **before** the database name) with every `odev` command (create, run, test).
-- **MANDATORY**: When using `odev create`, you MUST ALWAYS specify the Odoo version with `-V <version>` AND use `--no-pretty` before the database name.
-  - **Correct Example**: `odev create -V {target_ver} --no-pretty {target_db}`
+- **MANDATORY**: When using `odev create`, you MUST ALWAYS specify the Odoo version with `-V <version>`.
+  - **Correct Example**: `odev create -V {target_ver} {target_db}`
 - If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `TASKS.md` frequently.
-- **Strictly Upgrade Only**: DO NOT rewrite, refactor, or change functionality of code or views (e.g., do not add new attributes like `invisible` "for a professional touch"). Your sole task is making the module compatible with the target version.
+- **Pragmatic & Modern Upgrade**: Your goal is to make the module perfectly compatible and aligned with Odoo {target_ver} standards. While you should avoid purely cosmetic refactors, you MUST implement technical modernizations required by the new version. This includes migrating to `kanban.card`, adding necessary attributes like `column_invisible`, and updating JS hooks. If the Target Odoo version shows a "Standard" way of implementing a feature, you MUST follow it.
 - **Maintain Feature Coverage**: If a feature or piece of code is broken during the upgrade, **DO NOT** simply remove it. You must maintain the same feature coverage by either replacing it with a new implementation compatible with {target_ver} or by implementing a workaround.
 - **Delegate Heavy Tasks**: If your CLI supports sub-agents or delegation tools (like `generalist`), use them to parallelize or offload heavy analysis, repetitive editing, or complex research tasks.
 - **Package Installation**: If you encounter a `ModuleNotFoundError` or need to install a python package, **ALWAYS** use: `odev venv {target_db} -c "pip install <package>"` to ensure it is installed in the correct virtual environment.
@@ -402,6 +385,18 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 version=target_ver,
                 resume=self.args.resume,
             )
+
+            # Ask the user if they want to run the tests after leaving the upgrade
+            if self.console.confirm(
+                "Upgrade session finished. Would you like to launch 'odev test --ai' to verify the upgrade?",
+                default=False,
+            ):
+                modules = self.args.module_name or ",".join(
+                    [m["name"] for m in self._get_sorted_modules([self.args.path])]
+                )
+                test_cmd = f"test --ai {target_db} -V {target_ver} -i {modules}"
+                logger.info(f"Launching verification tests: odev {test_cmd}")
+                self.odev.run_command(*test_cmd.split())
 
         finally:
             logger.info("Finishing upgrade session.")
