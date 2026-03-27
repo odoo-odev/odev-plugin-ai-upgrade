@@ -1,6 +1,9 @@
 """Upgrade Odoo modules using AI."""
 
 import socket
+import subprocess
+import tempfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import networkx as nx
@@ -352,6 +355,91 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
         return prompt, sandbox_dirs, from_ver, target_ver, target_db
 
+    @contextmanager
+    def _ephemeral_postgresql(self, db_to_clone: str | None = None):
+        """Context manager to start and stop an ephemeral PostgreSQL cluster."""
+        import shutil
+
+        pg_dir = Path(tempfile.mkdtemp(prefix="odev-pg-"))
+        pg_socket = Path(tempfile.mkdtemp(prefix="odev-pg-socket-"))
+        pg_log = pg_dir / "postgresql.log"
+
+        try:
+            logger.info("Initializing ephemeral PostgreSQL cluster...")
+            subprocess.run(["initdb", "-D", str(pg_dir)], check=True, capture_output=True)
+
+            logger.info("Starting ephemeral PostgreSQL cluster...")
+            try:
+                subprocess.run(
+                    [
+                        "pg_ctl",
+                        "-D", str(pg_dir),
+                        "-l", str(pg_log),
+                        "-o", f"-c listen_addresses='' -k {pg_socket}",
+                        "start",
+                    ],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                )
+
+                # Manual wait for ready state
+                import time
+                ready = False
+                for _ in range(30):  # 15 seconds max
+                    res = subprocess.run(
+                        ["pg_isready", "-h", str(pg_socket)],
+                        capture_output=True
+                    )
+                    if res.returncode == 0:
+                        ready = True
+                        break
+                    time.sleep(0.5)
+
+                if not ready:
+                    log_content = pg_log.read_text() if pg_log.exists() else "No log file found."
+                    logger.error(f"Ephemeral PostgreSQL failed to start in time. Log:\n{log_content}")
+                    raise RuntimeError("PostgreSQL cluster failed to become ready.")
+
+            except subprocess.CalledProcessError as e:
+                log_content = pg_log.read_text() if pg_log.exists() else "No log file found."
+                logger.error(f"Failed to start ephemeral PostgreSQL cluster: {e.stderr or e.stdout}\nLog:\n{log_content}")
+                raise
+
+            # Get existing databases to clone
+            res = subprocess.run(["psql", "-ltq"], capture_output=True, text=True)
+            existing_dbs = [line.split("|")[0].strip() for line in res.stdout.splitlines() if line.strip()]
+
+            # Clone 'odev' if it exists
+            if "odev" in existing_dbs:
+                logger.info("Cloning 'odev' database into ephemeral cluster (Sandbox isolation)...")
+                subprocess.run(["createdb", "-h", str(pg_socket), "odev"], check=True)
+                subprocess.run(
+                    f"pg_dump odev | psql -h {pg_socket} -d odev",
+                    shell=True,
+                    check=True,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            # Clone target database if specified
+            if db_to_clone and db_to_clone in existing_dbs and db_to_clone != "odev":
+                logger.info(f"Cloning target database {db_to_clone!r} into ephemeral cluster...")
+                subprocess.run(["createdb", "-h", str(pg_socket), db_to_clone], check=False)
+                subprocess.run(
+                    f"pg_dump {db_to_clone} | psql -h {pg_socket} -d {db_to_clone}",
+                    shell=True,
+                    check=False,
+                    stderr=subprocess.DEVNULL,
+                )
+
+            yield pg_socket
+
+        finally:
+            logger.info("Stopping ephemeral PostgreSQL cluster...")
+            subprocess.run(["pg_ctl", "-D", str(pg_dir), "stop"], check=False, capture_output=True)
+            shutil.rmtree(pg_dir, ignore_errors=True)
+            shutil.rmtree(pg_socket, ignore_errors=True)
+
     def _run_upgrade(self) -> None:
         """Internal logic for the upgrade process."""
         # Git safety checks
@@ -369,10 +457,15 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
             return
 
         prompt, sandbox_dirs, from_ver, target_ver, target_db = prepared
-
         agent = self.get_ai_agent()
 
-        try:
+        db_to_clone = (
+            self._database.name
+            if getattr(self, "_database", None) and self._database.platform.name != "dummy"
+            else None
+        )
+
+        with self._ephemeral_postgresql(db_to_clone=db_to_clone) as pg_socket:
             logger.info(
                 f"Starting Project-wide AI Upgrade ({self.args.cli or self.config.ai.favorite_cli}): "
                 f"from {from_ver} to {target_ver} (Target DB: {target_db})"
@@ -384,6 +477,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
                 database=target_db,
                 version=target_ver,
                 resume=self.args.resume,
+                pg_socket_dir=pg_socket,
             )
 
             # Ask the user if they want to run the tests after leaving the upgrade
@@ -397,9 +491,6 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
                 test_cmd = f"test --ai {target_db} -V {target_ver} -i {modules}"
                 logger.info(f"Launching verification tests: odev {test_cmd}")
                 self.odev.run_command(*test_cmd.split())
-
-        finally:
-            logger.info("Finishing upgrade session.")
 
     def _get_upgrade_databases(self) -> list[str]:
         """Return a list of local databases that look like upgrade databases."""
