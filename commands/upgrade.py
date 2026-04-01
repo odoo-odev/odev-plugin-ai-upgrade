@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import networkx as nx
 
@@ -14,8 +15,13 @@ from odev.common.connectors import GitConnector
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
 from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
+from odev.common.version import OdooVersion as _OV
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
+
+
+if TYPE_CHECKING:
+    from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import KnowledgeIndex
 
 
 logger = logging.getLogger(__name__)
@@ -127,6 +133,97 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             s.bind(("", 0))
             return s.getsockname()[1]
 
+    @staticmethod
+    def _resolve_standard_deps(
+        modules_info: list[dict],
+        from_ver: str,
+    ) -> dict[str, str]:
+        """Return the transitive standard Odoo dependencies of the given custom modules.
+
+        Walks depends transitively. Only modules found in the community (``odoo/odoo``)
+        or enterprise (``odoo/enterprise``) worktree for ``from_ver`` are included.
+        Custom repo modules are excluded.
+
+        :returns: ``{module_name: "community" | "enterprise"}``
+        """
+        import ast
+
+        from odev.common.connectors import GitConnector
+        from odev.common.odoobin import ODOO_COMMUNITY_REPOSITORIES, ODOO_ENTERPRISE_REPOSITORIES
+
+        custom_names: set[str] = {m["name"] for m in modules_info}
+
+        # Build addons-path lookup maps for the source version worktree
+        # Community: worktree/<ver>/odoo/addons  +  worktree/<ver>/odoo/odoo/addons (older layout)
+        # Enterprise: worktree/<ver>/enterprise/
+        community_connector = GitConnector(ODOO_COMMUNITY_REPOSITORIES[0])
+        enterprise_connector = GitConnector(ODOO_ENTERPRISE_REPOSITORIES[0])
+
+        def _addons_roots(connector: "GitConnector", version: str) -> list[Path]:
+            roots: list[Path] = []
+            for wt in connector.worktrees():
+                if wt.name == version:
+                    for sub in ["", "addons", "odoo/addons"]:
+                        candidate = wt.path / sub if sub else wt.path
+                        if OdoobinProcess.check_addons_path(candidate):
+                            roots.append(candidate)
+            return roots
+
+        community_roots = _addons_roots(community_connector, from_ver)
+        enterprise_roots = _addons_roots(enterprise_connector, from_ver)
+
+        def _find_module(name: str) -> tuple[dict, str] | None:
+            """Return (manifest_dict, kind) if module is found in an Odoo tree."""
+            # Try existing worktrees first (faster)
+            for root in community_roots:
+                candidate = root / name / "__manifest__.py"
+                if candidate.exists():
+                    manifest = OdoobinProcess.read_manifest(candidate)
+                    if manifest:
+                        return manifest, "community"
+            for root in enterprise_roots:
+                candidate = root / name / "__manifest__.py"
+                if candidate.exists():
+                    manifest = OdoobinProcess.read_manifest(candidate)
+                    if manifest:
+                        return manifest, "enterprise"
+
+            # Fallback: research via git (no worktree required)
+            for connector, kind in [
+                (community_connector, "community"),
+                (enterprise_connector, "enterprise"),
+            ]:
+                for sub in ["", "addons", "odoo/addons"]:
+                    path = f"{sub}/{name}/__manifest__.py" if sub else f"{name}/__manifest__.py"
+                    try:
+                        content = connector.repository.git.show(f"{from_ver}:{path}")
+                        manifest = ast.literal_eval(content)
+                        if isinstance(manifest, dict):
+                            return manifest, kind
+                    except Exception:
+                        continue
+            return None
+
+        resolved: dict[str, str] = {}
+        queue: set[str] = set()
+
+        # Seed the queue with direct depends of every custom module
+        for m in modules_info:
+            queue.update(m.get("depends", []))
+
+        while queue:
+            mod = queue.pop()
+            if mod in resolved or mod in custom_names:
+                continue
+            found = _find_module(mod)
+            if found:
+                manifest, kind = found
+                resolved[mod] = kind
+                queue.update(manifest.get("depends", []))
+            # third-party / not found → silently skip
+
+        return resolved
+
     def run(self) -> None:
         """Execute the upgrade command."""
         try:
@@ -136,24 +233,26 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         finally:
             self._cleanup_wizard(stage="post-flight")
 
-    def _prepare_upgrade(self) -> tuple[str, list[str], str, str, str] | None:
+    def _prepare_upgrade(
+        self,
+    ) -> tuple[str, list[str], list[str], str, str, str, "KnowledgeIndex | None"] | None:
         """Prepare the upgrade environment and generate the AI prompt."""
-        from_ver = self.args.from_version or self._database.version
+        from_ver = (
+            self.args.from_version
+            or OdoobinProcess.version_from_manifest(self.args.path)
+            or OdoobinProcess.version_from_addons(self.args.path)
+            or self._database.version
+        )
+
         if not from_ver:
-            # Try to detect version from the path if no database version is available
-            from_ver = OdoobinProcess.version_from_manifest(self.args.path) or OdoobinProcess.version_from_addons(
-                self.args.path
+            logger.error(
+                f"Could not determine source version from path '{self.args.path}' or database '{self._database.name}'. "
+                "Ensure the path contains valid Odoo modules or use --from-version."
             )
-            if from_ver:
-                logger.info(f"Detected source version {from_ver} from path {self.args.path}")
-            else:
-                logger.error(
-                    f"Could not determine source version from database '{self._database.name}' or path '{self.args.path}'. "
-                    "Ensure the database exists or the path contains valid Odoo modules."
-                )
-                return None
+            return None
 
         from_ver = str(from_ver)
+        logger.info(f"Detected source version: {from_ver}")
 
         target_ver = self.args.to_version or ""
         if not target_ver:
@@ -211,29 +310,89 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             "Use `grep` or `git grep` within this directory to find mentions of your module or specific fields/methods that have changed."
         )
 
-        # Load existing report or create a new one
+        # --- Resolve source and target paths for prompt context ---------------------
+        from odev.common.version import OdooVersion
+
+        from_odoobin = OdoobinProcess(self._database).with_version(_OV(from_ver))
+        try:
+            # Only resolve path if worktree already exists to avoid auto-triggering creation
+            if (self.odev.worktrees_path / from_ver).exists():
+                from_odoo_path = from_odoobin.odoo_path.as_posix()
+            else:
+                from_odoo_path = f"Virtual (Ref: {from_ver} in Target Odoo)"
+        except Exception:
+            from_odoo_path = "Unknown"
+
+        target_odoobin = OdoobinProcess(self._database).with_version(OdooVersion(target_ver))
+        try:
+            # If target worktree does missing, it will be created below.
+            target_odoo_path = target_odoobin.odoo_path.as_posix()
+        except Exception:
+            target_odoo_path = (self.odev.worktrees_path / target_ver / "odoo").as_posix()
+
+        # --- Knowledge Index integration -------------------------------------------
+        from odev.common.store.datastore import DataStore
+
+        from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import KnowledgeIndex
+
+        ki: KnowledgeIndex | None = None
+        knowledge_context = ""
+        knowledge_local_path: str | None = None
+        version_pairs: dict = {}
+        standard_deps: dict = {}
+
+        try:
+            ki = KnowledgeIndex(self.config, DataStore())
+            if ki.ensure_setup():
+                with progress.spinner("Syncing upgrade knowledge repository"):
+                    ki.clone_or_pull()
+                    ki.migrate_to_consolidated()
+
+                # Resolve standard (community/enterprise) deps — NOT the custom modules
+                standard_deps = self._resolve_standard_deps(modules_info, from_ver)
+                if standard_deps:
+                    logger.info(f"Knowledge index: tracking {len(standard_deps)} standard Odoo module dependencies.")
+                else:
+                    logger.warning(
+                        "Knowledge index: no standard Odoo dependencies resolved. "
+                        f"Ensure worktree for {from_ver!r} is available."
+                    )
+
+                # Discover intermediate steps via KnowledgeIndex fallback (no explicit version discovery)
+                version_pairs = ki.get_version_pairs(
+                    from_ver,
+                    target_ver,
+                    upgrade_path=upgrade_path,
+                    modules=standard_deps,
+                )
+
+                # Load existing knowledge as context — no stubs, no Phase 1
+                if version_pairs and standard_deps:
+                    knowledge_context = ki.load_knowledge(standard_deps, version_pairs)
+                    if knowledge_context:
+                        logger.info("Knowledge index: loaded existing upgrade context for AI prompt.")
+                    else:
+                        logger.info(
+                            "Knowledge index: No existing notes found for these modules yet. The AI will discover and record findings during the upgrade."
+                        )
+                knowledge_local_path = ki.local_path.as_posix()
+            else:
+                ki = None  # User skipped setup — proceed without KI
+        except Exception as e:
+            logger.warning(f"Knowledge index unavailable: {e}. Proceeding without it.")
+            ki = None
+        # ---------------------------------------------------------------------------
+
         report_path = self.args.path / "UPGRADE.md"
         report_exists = report_path.exists()
         if report_exists:
             logger.info(f"Existing upgrade report found at {report_path}")
 
-        from odev.common.version import OdooVersion
+        # Prepare environment for TARGET version.
+        # Source Odoo is researched via git history in the target repo to avoid "useless worktree" creation.
+        version_list = [target_ver]
 
-        # Resolve source and target paths
-        from_odoobin = OdoobinProcess(self._database)
-        try:
-            from_odoo_path = from_odoobin.odoo_path.as_posix()
-        except Exception:
-            from_odoo_path = "Unknown (not yet created/cloned)"
-
-        target_odoobin = OdoobinProcess(self._database).with_version(OdooVersion(target_ver))
-        try:
-            target_odoo_path = target_odoobin.odoo_path.as_posix()
-        except Exception:
-            target_odoo_path = "Unknown (not yet created/cloned)"
-
-        # Prepare environments
-        for version in sorted({from_ver, target_ver}):
+        for version in version_list:
             logger.info(f"Preparing environment for Odoo {version}...")
             if not (self.odev.worktrees_path / version).exists():
                 self.odev.run_command("worktree", "-C", version, "-V", version)
@@ -263,15 +422,23 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if is_ps_custom_external:
             fast_verify = f"- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`). Then, verify the presence of new fields or view rendering via a minimal test or manual check. You MUST use `--http-port {free_port}` if you launch Odoo."
         else:
-            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run --http-port {free_port} --log-level=warn {target_db} -i <module_name> without-demo=False`. Then, verify the presence of new fields, view rendering, or basic logic via a minimal test or tour."
+            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run {target_db} -i <module_name> --http-port {free_port} --log-level=warn without-demo=False`. Then, verify the presence of new fields, view rendering, or basic logic via a minimal test or tour."
 
-        prompt = f"""You are an expert Odoo Upgrade Lead. Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
+        # Build the full prompt: existing knowledge context + upgrade instructions
+        knowledge_prefix = ""
+        if knowledge_context:
+            knowledge_prefix = knowledge_context + "\n\n---\n\n"
+
+        prompt = (
+            knowledge_prefix
+            + f"""You are an expert Odoo Upgrade Lead. Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
 
 ### Context:
 - **Source Odoo**: Version {from_ver} at `{from_odoo_path}` (Git repo).
 - **Target Odoo**: Version {target_ver} at `{target_odoo_path}` (Git repo).
 - **Project Root**: `{self.args.path.resolve().as_posix()}`
 - **Target Database**: `{target_db}` (Use this for all installations and tests).
+- **Upgrade Knowledge Base**: `{knowledge_local_path or "<knowledge_repo>"}` (Read/Write access). Use this to find and record upgrade-specific Odoo knowledge.
 - **Modules to Upgrade**:
 {modules_list_str}
 
@@ -281,6 +448,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
 ### Your Process:
 1. **Analyze & Plan**: First, analyze the modules and their dependencies. **Describe your plan in the chat**, and then create (or update) a `TASKS.md` file in the root directory with a detailed checklist of your planned steps.
+   - **Verify Against Standard Features**: Before adapting any custom code, check if the existing custom functionality has been implemented as standard features in Odoo {target_ver}. Consult the Odoo documentation and release notes. If a feature can be replaced by a standard one, you can replace the custom code with the standard one.
 2. **Execution & Fast Verification**: For each module (in dependency order):
    - **Update `TASKS.md`**: Mark items as `[/]` (in progress) or `[x]` (completed).
 
@@ -310,8 +478,18 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
    - **Data Migrations**: If your code changes involve structural modifications (e.g., field renames, moving fields to another model, renaming models, or model merges), **you MUST create migration scripts** to prevent data loss.
      - **MANDATORY**: Moving fields/data between models (like `stock.valuation.layer` to `stock.move`) is a destructive operation without a script.
+     - **Migration Helpers**: Use `from odoo.upgrade import util` and its safe helper methods:
+       - `util.rename_field(cr, model, old_name, new_name)`: Renames a field and updates references.
+       - `util.remove_field(cr, model, field_name)`: Safely removes a field.
+       - `util.rename_module(cr, old_name, new_name)`: Renames the module and all references.
+       - `util.merge_module(cr, old_name, into_name)`: Merges references from an old module.
+       - `util.recompute_fields(cr, model, fields)`: Safely recomputes field values in batches.
 
    - **Use Upgrade Utils**: When writing migration scripts, use Odoo's Upgrade Utils (`util.py`). Refer to [Odoo Upgrade Utils](https://www.odoo.com/documentation/18.0/th/developer/reference/upgrades/upgrade_utils.html).
+     - If `odoo-upgrade` is not available, you can install it using: `python3 -m pip install git+https://github.com/odoo/upgrade-util@master --break-system-packages` (or use `odev venv`).
+   - **External Dependencies**: If your migration scripts require external Python libraries (such as `custom-util`), you MUST add them to the `requirements.txt` file in the root of the module you are upgrading.
+     - Common PS utility: `git+https://github.com/odoo-ps/custom-util.git#egg=custom-util`
+     - **IMPORTANT**: Do NOT add these dependencies to the `odev-plugin-ai-upgrade` plugin itself. They belong to the module being upgraded.
 
    - **Migration Files**: Place scripts in `<module>/migrations/{target_ver}/` as `pre-migration.py`, `post-migration.py`, or `end-migration.py`.
 
@@ -320,6 +498,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
    - **Log Verification**: When running execution or verification commands, you MUST inspect the full log output. A successful exit status does not guarantee that the Odoo registry loaded correctly. Explicitly check for `Registry` load failures, `TypeError`, or `AttributeError` which often indicate model-level incompatibilities.
    - **Recursive Audit**: You MUST perform a recursive audit of every file in the module, including `static/` JS files, templates (XML), and tours. Compare their implementation logic with equivalent or similar files in Odoo Core to ensure no functional breakage in "invisible" technical layers.
    - **Python API Compatibility & "Broken Hooks"**: For every module, systematically audit all overridden methods (e.g., `read_group`, `search`, `name_get`). **Prioritize core models** like `stock.move`, `sale.order`, and `account.move`. Even if the signature appears unchanged, the internal calling logic in Odoo Core may have shifted, requiring adjustments in your inherited methods to ensure they are still triggered or behave correctly.
+   - **Test Intent Preservation**: If the module has existing tests, keep them. Adapt their syntax so they pass in the new version, but **DO NOT change the core business flow** they are designed to test.
    - **DO NOT** run `odev test` at this stage as it is too slow for individual iterations.
 
 3. **Global Verification (Final Step)**: Once ALL modules in your plan are upgraded and install cleanly, run the full test suite for the entire project: `odev test --log-level=warn {target_db} -i <comma_separated_modules>`.
@@ -334,26 +513,66 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
 ### Mandatory Rules:
 - **MANDATORY**: When using `odev create`, you MUST ALWAYS specify the Odoo version with `-V <version>`.
-  - **Correct Example**: `odev create -V {target_ver} {target_db}`
+  - **Correct Example**: `odev create -f -V {target_ver} {target_db} --log-level=warn`
+- **Speed up iteration**: To speed up testing, you can create a template database with standard modules using `-T` (no custom module), then use `create -t` (from template) to install your custom module.
+  - Example (Create template): `odev create -f -T -V {target_ver} my_base:template -i sale,purchase,stock`
+  - Example (Clone from template): `odev create -f -t my_base:template -V {target_ver} {target_db} -i <module_name>`
 - If `TASKS.md` or `UPGRADE.md` already exist, read them first to resume work. Update `TASKS.md` frequently.
 - **Pragmatic & Modern Upgrade**: Your goal is to make the module perfectly compatible and aligned with Odoo {target_ver} standards. While you should avoid purely cosmetic refactors, you MUST implement technical modernizations required by the new version. This includes migrating to `kanban.card`, adding necessary attributes like `column_invisible`, and updating JS hooks. If the Target Odoo version shows a "Standard" way of implementing a feature, you MUST follow it.
 - **Maintain Feature Coverage**: If a feature or piece of code is broken during the upgrade, **DO NOT** simply remove it. You must maintain the same feature coverage by either replacing it with a new implementation compatible with {target_ver} or by implementing a workaround.
-- **Delegate Heavy Tasks**: If your CLI supports sub-agents or delegation tools (like `generalist`), use them to parallelize or offload heavy analysis, repetitive editing, or complex research tasks.
+- **Delegate Tasks**: If your CLI supports sub-agents or delegation tools (like `generalist`), use them to parallelize or offload heavy analysis, repetitive editing, or complex research tasks.
 - **Package Installation**: If you encounter a `ModuleNotFoundError` or need to install a python package, **ALWAYS** use: `odev venv {target_db} -c "pip install <package>"` to ensure it is installed in the correct virtual environment.
 - **Status Prefix**: When providing updates, thinking, or describing your plan in the chat, **ALWAYS** prefix your message with the name of the module you are currently working on in brackets (e.g., `[module_name] Your message here`).
+
+### 📓 Knowledge Write-Back (MANDATORY — after each module)
+
+This knowledge base is permanent and reused across all future upgrades. As you upgrade each module, you are responsible for recording what you discover.
+
+**After completing the upgrade of each module:**
+1. For each of its standard Odoo dependencies that changed, open `{knowledge_local_path or "<knowledge_repo>/knowledge"}/<dep_module>.md`.
+2. Find the `## {from_ver} → {target_ver}` section (or create it if missing, using the format: `## {from_ver} → {target_ver}`).
+3. Append your findings under the relevant sub-headers (`### Field Changes`, `### Method / API Changes`, `### Framework / View Changes`, `### Migration Script Notes`, `### Notes / Tips`).
+4. Keep entries **compact**: bullet points only, no prose. Include commit hashes or file paths as evidence where possible.
+5. Write `_No changes._` in sub-headers that are genuinely empty — **do NOT leave them blank**.
+
+**At the very end of the session**, after all modules are complete and verified:
+```bash
+git -C {knowledge_local_path or "<knowledge_repo>"} add -A
+git -C {knowledge_local_path or "<knowledge_repo>"} commit -m "knowledge: {from_ver}→{target_ver} upgrade findings"
+```
 """
+        )
         if self.args.comment:
             prompt += f"\n### Additional User Instructions:\n- {self.args.comment}\n"
 
-        sandbox_dirs = [str(Path(self.args.path).resolve())]
-        if from_odoo_path and "Unknown" not in from_odoo_path:
-            sandbox_dirs.append(from_odoo_path)
-        if target_odoo_path and "Unknown" not in target_odoo_path:
-            sandbox_dirs.append(target_odoo_path)
+        # Collect sandbox directories
+        # We include the project root (RW) and the entire worktrees path (RO)
+        # plus specific addons paths for all involved versions to ensure proper bindings.
+        # We only include the target version to stay consistent with the "useless worktree" elimination.
+        sandbox_dirs = [
+            str(Path(self.args.path).resolve()),
+        ]
+        extra_bind_dirs = [
+            str(self.odev.worktrees_path),
+        ]
+
+        for version in version_list:
+            v_odoobin = OdoobinProcess(self._database).with_version(_OV(version))
+            try:
+                for path in v_odoobin.addons_paths:
+                    if path.exists():
+                        extra_bind_dirs.append(str(path))
+            except Exception:
+                continue
+
         if upgrade_repo_added:
             sandbox_dirs.append(str(Path(upgrade_path).resolve()))
 
-        return prompt, sandbox_dirs, from_ver, target_ver, target_db
+        # Allow the AI to write into the knowledge repo when populating stubs
+        if knowledge_local_path:
+            sandbox_dirs.append(knowledge_local_path)
+
+        return prompt, sandbox_dirs, extra_bind_dirs, from_ver, target_ver, target_db, ki
 
     @contextmanager
     def _ephemeral_postgresql(self, db_to_clone: str | None = None):
@@ -373,9 +592,12 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
                 subprocess.run(
                     [
                         "pg_ctl",
-                        "-D", str(pg_dir),
-                        "-l", str(pg_log),
-                        "-o", f"-c listen_addresses='' -k {pg_socket}",
+                        "-D",
+                        str(pg_dir),
+                        "-l",
+                        str(pg_log),
+                        "-o",
+                        f"-c listen_addresses='' -k {pg_socket}",
                         "start",
                     ],
                     check=True,
@@ -385,12 +607,10 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
                 # Manual wait for ready state
                 import time
+
                 ready = False
                 for _ in range(30):  # 15 seconds max
-                    res = subprocess.run(
-                        ["pg_isready", "-h", str(pg_socket)],
-                        capture_output=True
-                    )
+                    res = subprocess.run(["pg_isready", "-h", str(pg_socket)], capture_output=True)
                     if res.returncode == 0:
                         ready = True
                         break
@@ -403,7 +623,9 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
 
             except subprocess.CalledProcessError as e:
                 log_content = pg_log.read_text() if pg_log.exists() else "No log file found."
-                logger.error(f"Failed to start ephemeral PostgreSQL cluster: {e.stderr or e.stdout}\nLog:\n{log_content}")
+                logger.error(
+                    f"Failed to start ephemeral PostgreSQL cluster: {e.stderr or e.stdout}\nLog:\n{log_content}"
+                )
                 raise
 
             # Get existing databases to clone
@@ -418,6 +640,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
                     f"pg_dump odev | psql -h {pg_socket} -d odev",
                     shell=True,
                     check=True,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
 
@@ -429,6 +652,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
                     f"pg_dump {db_to_clone} | psql -h {pg_socket} -d {db_to_clone}",
                     shell=True,
                     check=False,
+                    stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
 
@@ -456,7 +680,7 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
         if not prepared:
             return
 
-        prompt, sandbox_dirs, from_ver, target_ver, target_db = prepared
+        prompt, sandbox_dirs, extra_bind_dirs, from_ver, target_ver, target_db, ki = prepared
         agent = self.get_ai_agent()
 
         db_to_clone = (
@@ -474,11 +698,40 @@ Check `UPGRADE.md` and `TASKS.md` in the project root to understand the current 
             agent.run(
                 prompt,
                 sandbox_dirs,
+                extra_bind_dirs=extra_bind_dirs,
                 database=target_db,
                 version=target_ver,
                 resume=self.args.resume,
                 pg_socket_dir=pg_socket,
             )
+
+            # Offer to sync new knowledge findings to the knowledge repo as a PR
+            if ki and ki.is_configured():
+                if self.console.confirm(
+                    "Would you like to sync new knowledge findings to the knowledge index repo as a PR?",
+                    default=True,
+                ):
+                    import re as _re
+
+                    branch_safe = _re.sub(
+                        r"[^a-zA-Z0-9._-]",
+                        "-",
+                        f"odev/upgrade-knowledge-{from_ver}-{target_ver}",
+                    )
+                    pr_url = ki.commit_and_pr(
+                        branch_name=branch_safe,
+                        commit_message=f"feat(knowledge): add/update entries for {from_ver}→{target_ver} upgrade",
+                        pr_title=f"[Knowledge] {from_ver} → {target_ver} upgrade findings",
+                        pr_body=(
+                            f"This PR was automatically created by `odev upgrade` after upgrading "
+                            f"from Odoo **{from_ver}** to **{target_ver}**.\n\n"
+                            "Please review the knowledge entries and merge when satisfied."
+                        ),
+                    )
+                    if pr_url:
+                        logger.info(f"Knowledge PR created: {pr_url}")
+                    else:
+                        logger.info("No new knowledge changes to sync (nothing to commit).")
 
             # Ask the user if they want to run the tests after leaving the upgrade
             if self.console.confirm(
