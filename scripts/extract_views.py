@@ -8,7 +8,7 @@ def main(env):
         return
 
     view_ids = os.environ.get("ODEV_STUDIO_VIEW_IDS", "")
-    domain = [("active", "=", False)]
+    domain: list[tuple[str, str, object] | str] = [("active", "=", False)]
 
     if view_ids:
         ids_to_search = []
@@ -37,34 +37,42 @@ def main(env):
 
     result = []
     for view in views:
-        parent_arch = view.inherit_id.arch_db if view.inherit_id else None
-        parent_name = view.inherit_id.name if view.inherit_id else None
+        # Recursive Parent Chain extraction
+        parent_chain = []
+        curr = view.inherit_id
+        while curr:
+            # Try to get XML ID for parent
+            p_xml_id = None
+            p_ext_ids = curr.get_external_id()
+            if p_ext_ids and p_ext_ids.get(curr.id):
+                p_xml_id = p_ext_ids.get(curr.id)
 
-        # Try to get a real XML ID
+            if not p_xml_id:
+                p_data = env["ir.model.data"].search([("model", "=", "ir.ui.view"), ("res_id", "=", curr.id)], limit=1)
+                p_xml_id = f"{p_data.module}.{p_data.name}" if p_data else f"__export__.ir_ui_view_{curr.id}"
+
+            parent_chain.append(
+                {
+                    "xml_id": p_xml_id,
+                    "name": curr.name,
+                    "arch": curr.arch_db,
+                }
+            )
+            curr = curr.inherit_id
+
+        # Try to get a real XML ID for current view
         xml_id = None
         ext_ids = view.get_external_id()
         if ext_ids and ext_ids.get(view.id):
             xml_id = ext_ids.get(view.id)
 
         if not xml_id:
-            # Fallback to searching ir_model_data if get_external_id fails
             data = env["ir.model.data"].search([("model", "=", "ir.ui.view"), ("res_id", "=", view.id)], limit=1)
-            if data:
-                xml_id = f"{data.module}.{data.name}"
-            else:
-                xml_id = f"__export__.ir_ui_view_{view.id}"
-
-        parent_xml_id = None
-        if view.inherit_id:
-            parent_ext_ids = view.inherit_id.get_external_id()
-            if parent_ext_ids and parent_ext_ids.get(view.inherit_id.id):
-                parent_xml_id = parent_ext_ids.get(view.inherit_id.id)
+            xml_id = f"{data.module}.{data.name}" if data else f"__export__.ir_ui_view_{view.id}"
 
         # Capture validation error
         validation_error = None
         try:
-            # Check if we can validate the view.
-            # In some Odoo versions it's _check_xml, in others it might be different.
             if hasattr(view, "_check_xml"):
                 view._check_xml()
             elif hasattr(view, "_validate_view_arch"):
@@ -79,9 +87,7 @@ def main(env):
                 "name": view.name,
                 "model": view.model,
                 "arch": view.arch_db,
-                "parent_xml_id": parent_xml_id,
-                "parent_name": parent_name,
-                "parent_arch": parent_arch,
+                "parent_chain": parent_chain,
                 "error": validation_error,
             }
         )

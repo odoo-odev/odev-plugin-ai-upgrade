@@ -67,78 +67,124 @@ class StudioCommand(OdoobinShellCommand, AICommandMixin):
         if isinstance(data, dict) and "error" in data:
             raise self.error(data["error"])
 
+        if not isinstance(data, list):
+            raise self.error("Extracted data is not a list.")
+
         if not data:
             logger.info("No disabled Studio views found.")
             return
 
         logger.info(f"Found {len(data)} disabled Studio view(s). Preparing AI Agent...")
 
-        prompt = self._build_prompt(data)
+        # Setup paths
+        plugin_root = Path(__file__).parent.parent
+        skills_path = (plugin_root / "skills").resolve()
+
+        # Create a temporary directory within the plugin root for the views data.
+        # This keeps it within an area we can mark as a 'workspace' for the AI.
+        data_tmp_dir = plugin_root / "tmp"
+        data_tmp_dir.mkdir(exist_ok=True)
+
+        with tempfile.NamedTemporaryFile(dir=data_tmp_dir, suffix=".json", mode="w", delete=False) as f:
+            json.dump(data, f, indent=2)
+            views_json_path = str(Path(f.name).resolve())
+
+        target_ver = str(getattr(self._database, "version", ""))
+        target_dir = str(self.args.path.resolve())
+
+        # Resolve workspaces (The list of directories the AI is allowed to work in)
+        workspaces = [target_dir]
+        if skills_path.exists():
+            workspaces.append(str(skills_path))
+        workspaces.append(str(data_tmp_dir.resolve()))
+
+        extra_bind_dirs = []
+        if hasattr(self, "odev") and self.odev.worktrees_path.exists():
+            extra_bind_dirs.append(str(self.odev.worktrees_path.resolve()))
+            workspaces.append(str(self.odev.worktrees_path.resolve()))
+
+        # Resolve target Odoo source paths
+        from odev.common.odoobin import OdoobinProcess
+        from odev.common.version import OdooVersion
+
+        target_odoobin = OdoobinProcess(self._database).with_version(OdooVersion(target_ver))
+
+        target_odoopath_host = target_odoobin.odoo_path.resolve()
+        target_odoo_path = "/source"
+
+        # We bind the root of the worktree to /source
+        # Typically target_odoopath_host is /.../worktrees/19.0/odoo
+        # So we bind /.../worktrees/19.0 to /source
+        worktree_root = target_odoopath_host.parent
+        extra_bind_dirs.append(f"{worktree_root}:/source")
+
+        target_addons_paths = []
+        try:
+            for p in target_odoobin.addons_paths:
+                if p.exists():
+                    p_abs = p.resolve()
+                    if p_abs.is_relative_to(worktree_root):
+                        # Use mapped path
+                        rel = p_abs.relative_to(worktree_root)
+                        target_addons_paths.append(f"/source/{rel}")
+                    else:
+                        # Outside worktree, bind separately if needed
+                        target_addons_paths.append(str(p_abs))
+                        if str(p_abs) not in extra_bind_dirs:
+                            extra_bind_dirs.append(str(p_abs))
+        except Exception:
+            target_addons_paths = []
+
+        prompt = self._build_prompt(data, views_json_path, "/home/odev/skills", target_odoo_path, target_addons_paths)
+        # Update extra_bind_dirs for skills mapping which is already handled in upgrade command but let's make it explicit here too
+        if skills_path.exists():
+            ks_bind = f"{skills_path}:/home/odev/skills"
+            if ks_bind not in extra_bind_dirs:
+                extra_bind_dirs.append(ks_bind)
         agent = self.get_ai_agent()
 
         try:
-            target_dir = str(self.args.path.resolve())
             agent.run(
-                prompt, [target_dir], database=self._database.name, version=str(getattr(self._database, "version", ""))
+                prompt,
+                workspaces,
+                extra_bind_dirs=extra_bind_dirs,
+                database=self._database.name,
+                version=target_ver,
             )
         finally:
+            if os.path.exists(views_json_path):
+                os.unlink(views_json_path)
             logger.info("Studio fixing session finished.")
 
     def run(self) -> None:
         """Run the studio fix command."""
         self._run_studio_fix()
 
-    def _build_prompt(self, views_data: list[dict]) -> str:
-        prompt = (
+    def _build_prompt(
+        self,
+        views_data: list[dict],
+        views_json_path: str,
+        skills_path: str,
+        target_odoo_path: str,
+        target_addons_paths: list[str],
+    ) -> str:
+        target_ver = str(getattr(self._database, "version", "unknown"))
+        target_dir = str(self.args.path.resolve())
+
+        addons_hint = (
+            "\n".join([f"- `{p}` (Addons Path)" for p in target_addons_paths])
+            or f"- `{target_odoo_path}/addons` (Default addons)"
+        )
+
+        return (
             "You are an expert Odoo Upgrade Engineer and Developer.\n"
-            "Your task is to fix Odoo Studio views that were deactivated (active=False) "
-            "during a database upgrade due to architecture validation errors.\n\n"
-            "CRITICAL REQUIREMENT:\n"
-            "You MUST NOT try to fix the views in the database directly. Instead, you MUST "
-            "generate a Python migration script (e.g. `16.0.1.0/post-migration.py`) and save it "
-            "into the provided target module directory.\n"
-            "You MUST use the `util` library (from https://github.com/odoo/upgrade-util) AND "
-            "`custom_util` (from https://github.com/odoo-ps/custom-util) in your script to correct these views.\n"
-            "For example, using `custom_util.update_view` or similar utilities.\n"
-            "If your migration scripts require external Python libraries (such as `custom-util`), "
-            "you MUST add them to the `requirements.txt` file in the root of the module you are upgrading.\n"
-            "Common PS utility: `git+https://github.com/odoo-ps/custom-util.git#egg=custom-util`\n\n"
-            "Example pattern:\n```python\n"
-            "from odoo.upgrade import util\n"
-            "from odoo.addons.base.maintenance.custom_util import update_view\n\n"
-            "def migrate(cr, version):\n"
-            "    # Code to update view arch here using custom_util\n"
-            "```\n"
-            "Here are the views that encountered an error during the upgrade:\n\n"
+            f"Your task is to fix {len(views_data)} deactivated Odoo Studio views for version {target_ver}.\n\n"
+            "MANDATORY INSTRUCTIONS:\n"
+            "Follow the methodology and confidentiality rules in the following Skill:\n"
+            f" - `{skills_path}/studio_upgrade`: Mandatory investigation and fixing workflow.\n\n"
+            "RESOURCES:\n"
+            f"- VIEW DATA: `{views_json_path}` (Full recursive inheritance chains included).\n"
+            f"- TARGET ODOO REPO: `{target_odoo_path}` (Direct git path to source code).\n"
+            f"- TARGET ADDONS PATHS:\n{addons_hint}\n"
+            f"- TARGET DIRECTORY: `{target_dir}` (Save your migration script here).\n"
         )
-        for v in views_data:
-            arch = v.get("arch") or ""
-            if isinstance(arch, dict):
-                arch = arch.get("en_US", next(iter(arch.values())) if arch else "")
-
-            parent_arch = v.get("parent_arch") or ""
-            if isinstance(parent_arch, dict):
-                parent_arch = parent_arch.get("en_US", next(iter(parent_arch.values())) if parent_arch else "")
-
-            prompt += f"--- VIEW XML_ID: {v['xml_id']} (ID: {v['id']}) ---\n"
-            prompt += f"Name: {v['name']}\nModel: {v['model']}\n"
-            prompt += f"Parent View: {v['parent_xml_id']} (Name: {v['parent_name']})\n"
-
-            if v.get("error"):
-                prompt += f"SPECIFIC ERROR FROM ODOO:\n{v['error']}\n"
-
-            prompt += "Broken Architecture:\n```xml\n" + str(arch) + "\n```\n"
-            prompt += (
-                "Parent Architecture Context (Look here to see why XPaths might be failing):\n```xml\n"
-                + str(parent_arch)
-                + "\n```\n"
-            )
-            prompt += "-" * 50 + "\n\n"
-
-        prompt += (
-            "Analyse the broken architecture against the parent view's architecture and the provided error message to figure out "
-            "which XPath expression is no longer valid. Then, produce the migration script "
-            "using `util` and `custom_util` that properly updates the architecture so the view "
-            "can be validated and reactivated. Save the file in the designated path.\n"
-        )
-        return prompt
