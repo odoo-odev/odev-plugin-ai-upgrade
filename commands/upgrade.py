@@ -15,7 +15,6 @@ from odev.common.connectors import GitConnector
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
 from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
-from odev.common.version import OdooVersion as _OV
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
 
@@ -63,6 +62,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         aliases=["-c", "--comment"],
         description="Add a custom comment/instruction to the AI prompt.",
         default="",
+    )
+
+    task_id = args.String(
+        aliases=["--task-id"],
+        description="The task ID for the upgrade (e.g., 12345). Mandatory for commit messages.",
+        required=True,
     )
 
     submodules = args.Flag(
@@ -228,7 +233,20 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
     def _prepare_upgrade(
         self,
-    ) -> (tuple[str, list[str], list[str], str, str, str, "KnowledgeIndex | None", list[dict],] | None):
+    ) -> (
+        tuple[
+            str,
+            list[str],
+            list[str],
+            str,
+            str,
+            str,
+            "KnowledgeIndex | None",
+            list[dict],
+            dict[str, str],
+        ]
+        | None
+    ):
         """Prepare the upgrade environment and generate the AI prompt."""
         from_ver = (
             self.args.from_version
@@ -252,8 +270,38 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             logger.error("Could not determine target version. Please specify a --to <version>.")
             return None
 
+        project_path = Path(self.args.path).resolve()
+        worktrees_path = self.odev.worktrees_path.resolve()
+        repositories_path = self.config.paths.repositories.resolve()
+        dumps_path = self.config.paths.dumps.resolve()
+        venvs_path = self.odev.venvs_path.resolve()
+        upgrade_path = self.config.paths.upgrade.resolve()
+        skills_path = (Path(__file__).parent.parent / "skills").resolve()
+
+        path_mapping = {
+            str(project_path): "/custom",
+            str(worktrees_path): "/worktree",
+            str(repositories_path): "/repositories",
+            str(dumps_path): "/dumps",
+            str(venvs_path): "/venvs",
+            str(upgrade_path): "/upgrade",
+            str(skills_path): "/skills",
+        }
+
+        def map_path(p: Path | str) -> str:
+            p_str = str(p)
+            # Sort by length descending to match longest prefix first
+            for host, guest in sorted(path_mapping.items(), key=lambda x: len(x[0]), reverse=True):
+                if p_str.startswith(host):
+                    return p_str.replace(host, guest)
+            return p_str
+
         sandbox_dirs = [
-            str(Path(self.args.path).resolve()),
+            f"{project_path}:/custom",
+            f"{worktrees_path}:/worktree",
+            f"{repositories_path}:/repositories",
+            f"{dumps_path}:/dumps",
+            f"{venvs_path}:/venvs",
         ]
         extra_bind_dirs = []
 
@@ -298,7 +346,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 upgrade_connector.clone()
             else:
                 upgrade_connector.pull(force=True)
-            extra_bind_dirs.append(f"{upgrade_path.resolve()}:/upgrade")
+            extra_bind_dirs.append(f"{upgrade_path}:/upgrade")
 
         upgrade_instructions = (
             f"\n- **Migration Scripts (Upgrade Repository)**: You have access to the official Odoo Enterprise migration scripts at `{upgrade_path.as_posix()}`. "
@@ -308,27 +356,22 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         )
 
         # --- Resolve source and target paths for prompt context ---------------------
-        from_odoobin = OdoobinProcess(self._database).with_version(_OV(from_ver))
         try:
             # Only resolve path if worktree already exists to avoid auto-triggering creation
-            if (self.odev.worktrees_path / from_ver).exists():
-                from_odoo_path_host = from_odoobin.odoo_path.resolve()
-                from_odoo_path = "/source/from"
-                sandbox_dirs.append(f"{from_odoo_path_host.parent}:/source/from")
+            if (worktrees_path / from_ver).exists():
+                from_odoo_path = f"/worktree/{from_ver}"
+                extra_bind_dirs.append(f"{worktrees_path}/{from_ver}:/worktree/{from_ver}")
             else:
                 from_odoo_path = f"Virtual (Ref: {from_ver} in Target Odoo)"
         except Exception:
             from_odoo_path = "Unknown"
 
-        target_odoobin = OdoobinProcess(self._database).with_version(_OV(target_ver))
         try:
-            target_odoo_path_host = target_odoobin.odoo_path.resolve()
-            target_odoo_path = "/source/target"
-            sandbox_dirs.append(f"{target_odoo_path_host.parent}:/source/target")
+            target_odoo_path = f"/worktree/{target_ver}"
+            extra_bind_dirs.append(f"{worktrees_path}/{target_ver}:/worktree/{target_ver}")
         except Exception:
-            target_odoo_path_host = (self.odev.worktrees_path / target_ver / "odoo").resolve()
-            target_odoo_path = "/source/target"
-            sandbox_dirs.append(f"{target_odoo_path_host.parent}:/source/target")
+            target_odoo_path = f"/worktree/{target_ver}"
+            extra_bind_dirs.append(f"{worktrees_path}/{target_ver}:/worktree/{target_ver}")
 
         # --- Knowledge Index integration -------------------------------------------
         from odev.common.store.datastore import DataStore
@@ -376,6 +419,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                             "Knowledge index: No existing notes found for these modules yet. The AI will discover and record findings during the upgrade."
                         )
                 knowledge_local_path = ki.local_path.as_posix()
+                path_mapping[knowledge_local_path] = "/knowledge"
+                extra_bind_dirs.append(f"{ki.local_path}:/knowledge")
             else:
                 ki = None  # User skipped setup — proceed without KI
         except Exception as e:
@@ -398,20 +443,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 self.odev.run_command("worktree", "-C", version, "-V", version)
             self.odev.run_command("pull", "-V", version)
 
-        # Re-resolve paths after preparation
-        try:
-            from_odoo_path = from_odoobin.odoo_path.as_posix()
-        except Exception:
-            pass
-
-        try:
-            target_odoo_path = target_odoobin.odoo_path.as_posix()
-        except Exception:
-            pass
-
         # Prepare module context for AI
         modules_list_str = "\n".join(
-            [f"- {m['name']} (Path: {m['path']}, Depends: {', '.join(m['depends'])})" for m in modules_info]
+            [f"- {m['name']} (Path: {map_path(m['path'])}, Depends: {', '.join(m['depends'])})" for m in modules_info]
         )
 
         repo_name = Path(self.args.path).resolve().name
@@ -420,9 +454,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         free_port = self._get_free_port()
 
         if is_ps_custom_external:
-            fast_verify = f"- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`). Then, verify the presence of new fields or view rendering via a minimal test or manual check. You MUST use `--http-port {free_port}` if you launch Odoo."
+            fast_verify = f"- **Verification (Fast)**: Verify the module using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`). Then, verify the presence of new fields or view rendering via a minimal test or manual check. You MUST use `--http-port {free_port} --stop-after-init` if you launch Odoo."
         else:
-            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run -f -V {target_ver} {target_db} -i <module_name> --http-port {free_port} --log-level=warn`. Then, verify the presence of new fields, view rendering, or basic logic via a minimal test or tour."
+            fast_verify = f"- **Verification (Fast)**: Verify the module installs cleanly (including demo data) using: `odev run -f -V {target_ver} {target_db} -i <module_name> --http-port {free_port} --log-level=warn --stop-after-init`. Then, verify the presence of new fields, view rendering, or basic logic via a minimal test or tour."
 
         # Build the full prompt: existing knowledge context + upgrade instructions
         knowledge_prefix = ""
@@ -434,11 +468,11 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             + f"""You are an expert Odoo Upgrade Lead. Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
 
 ### Context:
-- **Source Odoo**: Version {from_ver} at `{from_odoo_path}` (Git repo).
-- **Target Odoo**: Version {target_ver} at `{target_odoo_path}` (Git repo).
-- **Project Root**: `{self.args.path.resolve().as_posix()}`
+- **Source Odoo**: Version {from_ver} at `{from_odoo_path}`.
+- **Target Odoo**: Version {target_ver} at `{target_odoo_path}`.
+- **Project Root**: `/custom`
 - **Target Database**: `{target_db}` (Use this for all installations and tests).
-- **Upgrade Knowledge Base**: `{knowledge_local_path or "<knowledge_repo>"}` (Read/Write access). Use this to find and record upgrade-specific Odoo knowledge.
+- **Upgrade Knowledge Base**: `/knowledge` (Read/Write access). Use this to find and record upgrade-specific Odoo knowledge.
 - **Migration Scripts (Upgrade Repository)**: You have access to official scripts at `/upgrade`.
 - **Modules to Upgrade**:
 {modules_list_str}
@@ -452,10 +486,10 @@ For Odoo >= 18.0, you SHOULD first try to use `odev upgrade-code --from {from_ve
 **IMPORTANT**: You MUST wrap the glob pattern in double quotes to prevent your current shell from expanding it before it reaches the `odev` command.
 This tool can automate many common renames (e.g., `<tree>` to `<list>`).
 You MUST NOT pass a directory path as the first argument; you MUST use the database name `{target_db}` to ensure `odev` correctly resolves your addons environment. You may append the project directory path as a secondary argument if needed.
-You MUST also search for version-specific migration scripts in `odoo/odoo/upgrade_code` within the Target Odoo repository to understand how Odoo handles specific API changes.
-For information on available migration helpers (`util.rename_field`, `custom_util.custom_rename_field`, etc.), consult the following Skills:\n- **Standard Odoo Helpers**: `/home/odev/skills/odoo_upgrade_utils`
-- **PS Custom Helpers**: `/home/odev/skills/custom_util`
-- **ODEV CLI Usage**: `/home/odev/skills/odev` (Mandatory rules for `create`, `run`, `test`, `venv`, 'upgrade-code')
+You MUST also search for version-specific migration scripts in `odoo/odoo/upgrade_code` within the Target Odoo repository at `{target_odoo_path}` to understand how Odoo handles specific API changes.
+For information on available migration helpers (`util.rename_field`, `custom_util.custom_rename_field`, etc.), consult the following Skills:\n- **Standard Odoo Helpers**: `/skills/odoo_upgrade_utils`
+- **PS Custom Helpers**: `/skills/custom_util`
+- **ODEV CLI Usage**: `/skills/odev` (Mandatory rules for `create`, `run`, `test`, `venv`, 'upgrade-code')
 
 ### Your Process:
 1. **Analyze & Plan**: First, analyze the modules and their dependencies. **Describe your plan in the chat**, and then create (or update) a `TASKS.md` file in the root directory with a detailed checklist of your planned steps.
@@ -490,6 +524,25 @@ For information on available migration helpers (`util.rename_field`, `custom_uti
    - **Python API Compatibility & "Broken Hooks"**: For every module, systematically audit all overridden methods (e.g., `read_group`, `search`, `name_get`). **Prioritize core models** like `stock.move`, `sale.order`, and `account.move`. Even if the signature appears unchanged, the internal calling logic in Odoo Core may have shifted, requiring adjustments in your inherited methods to ensure they are still triggered or behave correctly.
    - **Test Intent Preservation**: If the module has existing tests, keep them. Adapt their syntax so they pass in the new version, but **DO NOT change the core business flow** they are designed to test.
    - **DO NOT** run `odev test` at this stage. Focus on making sure the module installs cleanly and passes fast manual verification.
+
+### Committing Rules:
+You MUST commit your changes to the module repository as you progress, using the following rules:
+1. **One commit per discrete change or fix**.
+2. **Commit Message Format**:
+   - **Summary (First line)**: `[UPG][{self.args.task_id}] module_name: Small description`
+   - **Body**: Detailed description of the logic change. You MUST include the **Source Commit ID** or **Core File Reference** from the Odoo/Enterprise target repository that explains why this adaptation was necessary.
+   - Example:
+     ```
+     [UPG][{self.args.task_id}] sale_order: Rename amount_total to amount_all
+
+     The field 'amount_total' was renamed to 'amount_all' in Odoo 18.0 to align with global naming conventions.
+     Source: odoo/odoo@abc123def456 (or odoo/addons/sale/models/sale_order.py)
+     ```
+3. **Task ID**: The task ID for this project is `{self.args.task_id}`.
+4. **Granularity & Scope**: Commits MUST stay at an acceptable level (not too fine-grained).
+   - Commits should be per "scope": e.g., "Renaming a field" means you commit both the model changes (.py) and the view changes (.xml) together.
+   - A logic-related fix or a full "code-upgrade" refactor should be one commit.
+5. **Stage before commit**: Always `git add` the relevant files before committing.
 
 3. **Detailed Reporting**: Update the `UPGRADE.md` file after each module.
    - **Reporting Structure**: For each module, you must provide a detailed list of changes:
@@ -528,7 +581,7 @@ git -C {knowledge_local_path or "<knowledge_repo>"} commit -m "knowledge: {from_
         # Add binary skill paths
         skills_path = Path(__file__).parent.parent / "skills"
         if skills_path.exists():
-            extra_bind_dirs.append(f"{skills_path.resolve()}:/home/odev/skills")
+            extra_bind_dirs.append(f"{skills_path.resolve()}:/skills")
 
         extra_bind_dirs.append(f"{self.odev.worktrees_path}:/worktrees_host")
 
@@ -545,6 +598,7 @@ git -C {knowledge_local_path or "<knowledge_repo>"} commit -m "knowledge: {from_
             target_db,
             ki,
             modules_info,
+            path_mapping,
         )
 
     @contextmanager
@@ -662,6 +716,7 @@ git -C {knowledge_local_path or "<knowledge_repo>"} commit -m "knowledge: {from_
             target_db,
             ki,
             modules_info,
+            path_mapping,
         ) = prepared
         agent = self.get_ai_agent()
 
@@ -685,6 +740,7 @@ git -C {knowledge_local_path or "<knowledge_repo>"} commit -m "knowledge: {from_
                 version=target_ver,
                 resume=self.args.resume,
                 pg_socket_dir=pg_socket,
+                path_mapping=path_mapping,
             )
 
             # --- Post-Upgrade Test & Fix Loop ---
