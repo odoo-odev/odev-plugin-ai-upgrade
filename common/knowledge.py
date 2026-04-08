@@ -61,8 +61,7 @@ class KnowledgeIndex:
     Repository structure::
 
         index.json              # machine-readable registry of all entries
-        knowledge/
-            <module>.md         # one file per module, sections for versions
+        <module>.md             # one file per module, sections for versions
 
     Usage::
 
@@ -165,15 +164,19 @@ class KnowledgeIndex:
             "\nTo use the knowledge index, you need a [bold]private GitHub repository[/bold]\n"
             "and a [bold]fine-grained personal access token[/bold] with these permissions:\n"
         )
-        console.print("  [bold color.cyan]Repository permissions[/bold color.cyan] (on your knowledge repo only):")
+        console.print("  [bold color.cyan]Repository permissions[/bold color.cyan] ([bold]Knowledge Repo[/bold]):")
         console.print("    • [bold]Contents[/bold]:       Read and Write  [dim](to push knowledge branches)[/dim]")
         console.print("    • [bold]Pull requests[/bold]:  Read and Write  [dim](to open review PRs)[/dim]")
         console.print("    • [bold]Metadata[/bold]:       Read            [dim](required by GitHub)[/dim]")
         console.print(
+            "\n  [italic]Note: Fine-grained tokens are scoped to a single organization. "
+            "You will be prompted separately for a GITHUB_TOKEN to access odoo/enterprise research.[/italic]"
+        )
+        console.print(
             "\n  Create at: [link=https://github.com/settings/tokens?type=beta]"
             "https://github.com/settings/tokens?type=beta[/link]"
         )
-        console.print('  → "Only select repositories" → pick your knowledge repo.\n')
+        console.print('  → "Only select repositories" → pick [bold]only[/bold] your knowledge repo.\n')
 
         if not console.confirm("Set up the knowledge index now?", default=True):
             logger.warning("Knowledge index setup skipped. You will be prompted again on the next upgrade.")
@@ -320,7 +323,7 @@ class KnowledgeIndex:
 
     @property
     def _knowledge_dir(self) -> Path:
-        return self.local_path / "knowledge"
+        return self.local_path
 
     def _load_index(self) -> dict:
         """Load index.json or return an empty structure."""
@@ -513,52 +516,6 @@ class KnowledgeIndex:
             "**Use it as your primary reference before researching core Odoo repositories.**\n\n"
             + "\n\n".join(formatted_sections)
         )
-
-    def migrate_to_consolidated(self) -> None:
-        """One-time migration helper to move from multi-file structure to single-file-per-module.
-
-        Moves knowledge/<module>/<from>-<to>.md -> knowledge/<module>.md (sections).
-        """
-        import shutil
-
-        if not self._knowledge_dir.exists():
-            return
-
-        for entry in self._knowledge_dir.iterdir():
-            if entry.is_dir():
-                logger.info("Migrating knowledge repository to consolidated structure...")
-                module = entry.name
-                module_file = self._knowledge_dir / f"{module}.md"
-                # Seed module file if it doesn't exist
-                if not module_file.exists():
-                    # We might not know the type yet, default to community
-                    module_file.write_text(KNOWLEDGE_MODULE_HEADER.format(module=module, type="community"))
-
-                sections_added = 0
-                # Process each version-pair file in the subdirectory
-                for ver_file in sorted(entry.iterdir()):
-                    if ver_file.suffix == ".md":
-                        # Match name: from-to.md
-                        ver_match = re.match(r"^([\w.]+)-([\w.]+)\.md$", ver_file.name)
-                        if ver_match:
-                            fv, tv = ver_match.groups()
-                            content = ver_file.read_text()
-                            # Strip frontmatter
-                            content = re.sub(r"^---\n.*?\n---\n", "", content, flags=re.DOTALL).strip()
-
-                            # Prepare section
-                            section = f"## {fv} → {tv}\nReviewed: false\nLast Updated: migrated\n\n{content}\n\n---\n\n"
-                            with module_file.open("a") as f:
-                                f.write(section)
-                            sections_added += 1
-
-                if sections_added:
-                    logger.info(f"Consolidated {sections_added} sections into {module}.md")
-
-                # Remove the now-empty (or fully migrated) directory
-                shutil.rmtree(entry)
-
-        self._update_index_json()
 
     # ------------------------------------------------------------------
     # Publishing: commit + PR via GitConnector + PyGitHub

@@ -45,10 +45,18 @@ This skill provides instructions on how to use `odev` (Odoo Development CLI) dur
         TypeErrors, or AttributeErrors.
 
 -   **`odev venv <database> -c "<command>"`**:
-
     -   Runs a command inside the virtual environment associated with the database.
     -   **Package Installation**: If a python package is missing, use:
         `odev venv <database> -c "pip install <package>"`.
+
+-   **`odev shell <database> [options]`**:
+    -   Starts an interactive Odoo shell for the specified database.
+    -   Use `--script "<python_code>"` to execute code and exit immediately.
+    -   **Example**: `odev shell my_db --script "print(self.env.user.name)"`
+
+-   **`odev deploy <module_path> [options]`**:
+    -   Hot-deploys a module to a **running** Odoo instance.
+    -   **Example**: `odev deploy /custom/my_module`
 
 -   **`odev upgrade-code <database> --from <ver> --to <ver>`**:
     -   Automatically migrates source code for common renames (e.g., `<tree>` to `<list>` in Odoo 18.0+).
@@ -62,3 +70,11 @@ This skill provides instructions on how to use `odev` (Odoo Development CLI) dur
     are used.
 -   **Prompt Bypassing**: Always use `-f` in scripts or automated tasks to ensure no interactive prompts block
     execution.
+
+## 📦 MODULE MANIFEST STANDARDS
+
+1. **VERSIONING**: When upgrading a module to a new Odoo version, you MUST reset the version in `__manifest__.py` to
+   `ODOO_VERSION.1.0.0` (e.g., `19.0.1.0.0`).
+    - **NEVER** preserve minor versions or patch increments from the source Odoo version (e.g., do not turn `16.3.1.2.3`
+      into `19.3.1.2.3`).
+    - The format MUST be: `<odoo_major>.0.1.0.0` for the first upgrade commit.
