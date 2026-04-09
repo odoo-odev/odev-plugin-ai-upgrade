@@ -1,3 +1,10 @@
+---
+name: custom_util
+description:
+    "PS-specific Odoo migration helpers for model/field renaming, Studio field transfers, and batch view updates,
+    ensuring proper registry state management."
+---
+
 # PS Custom Upgrade Utils Skill
 
 Use the `custom_util` module for PS-specific Odoo data migrations. These helpers extend the standard `upgrade-util`

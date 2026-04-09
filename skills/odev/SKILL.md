@@ -1,3 +1,10 @@
+---
+name: odev
+description:
+    "Mandatory CLI usage rules for Odoo development, covering database creation, versioning, argument ordering, and
+    server orchestration with odev."
+---
+
 # ODEV Commands Skill
 
 This skill provides instructions on how to use `odev` (Odoo Development CLI) during upgrade tasks.
@@ -45,16 +52,19 @@ This skill provides instructions on how to use `odev` (Odoo Development CLI) dur
         TypeErrors, or AttributeErrors.
 
 -   **`odev venv <database> -c "<command>"`**:
+
     -   Runs a command inside the virtual environment associated with the database.
     -   **Package Installation**: If a python package is missing, use:
         `odev venv <database> -c "pip install <package>"`.
 
 -   **`odev shell <database> [options]`**:
+
     -   Starts an interactive Odoo shell for the specified database.
     -   Use `--script "<python_code>"` to execute code and exit immediately.
     -   **Example**: `odev shell my_db --script "print(self.env.user.name)"`
 
 -   **`odev deploy <module_path> [options]`**:
+
     -   Hot-deploys a module to a **running** Odoo instance.
     -   **Example**: `odev deploy /custom/my_module`
 

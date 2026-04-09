@@ -97,4 +97,6 @@ def main(env):
 
 
 if __name__ == "__main__":
-    main(env)  # type: ignore
+    env = globals().get("env")
+    if env:
+        main(env)

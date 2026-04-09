@@ -36,6 +36,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
     _name = "upgrade"
     _database_arg_required = False
+    _target_db: str | None = None
 
     path = args.Path(
         aliases=["--path"],
@@ -114,9 +115,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             if search_path.is_dir():
                 for child in search_path.iterdir():
                     if child.is_dir() and (child / "__manifest__.py").exists():
-                        manifest = OdoobinProcess.read_manifest(
-                            child / "__manifest__.py"
-                        )
+                        manifest = OdoobinProcess.read_manifest(child / "__manifest__.py")
                         if manifest:
                             modules[child.name] = {
                                 "path": child,
@@ -161,10 +160,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         """
         import ast
 
-        from odev.common.odoobin import (
-            ODOO_COMMUNITY_REPOSITORIES,
-            ODOO_ENTERPRISE_REPOSITORIES,
-        )
+        from odev.common.odoobin import ODOO_COMMUNITY_REPOSITORIES, ODOO_ENTERPRISE_REPOSITORIES
 
         custom_names: set[str] = {m["name"] for m in modules_info}
 
@@ -209,11 +205,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 (enterprise_connector, "enterprise"),
             ]:
                 for sub in ["", "addons"]:
-                    path = (
-                        f"{sub}/{name}/__manifest__.py"
-                        if sub
-                        else f"{name}/__manifest__.py"
-                    )
+                    path = f"{sub}/{name}/__manifest__.py" if sub else f"{name}/__manifest__.py"
                     try:
                         content = connector.repository.git.show(f"{from_ver}:{path}")
                         manifest = ast.literal_eval(content)
@@ -251,25 +243,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         except KeyboardInterrupt:
             logger.warning("\nUpgrade interrupted by user.")
         finally:
-            exclude = [self._target_db] if getattr(self, "_target_db", None) else None
+            exclude = [self._target_db] if self._target_db else None
             self._cleanup_wizard(stage="post-flight", exclude=exclude)
 
     def _prepare_upgrade(
         self,
-    ) -> (
-        tuple[
-            str,
-            list[str],
-            list[str],
-            str,
-            str,
-            str,
-            "KnowledgeIndex | None",
-            list[dict],
-            dict[str, str],
-        ]
-        | None
-    ):
+    ) -> (tuple[str, list[str], list[str], str, str, str, "KnowledgeIndex | None", list[dict], dict[str, str],] | None):
         """Prepare the upgrade environment and generate the AI prompt."""
         from_ver = (
             self.args.from_version
@@ -290,9 +269,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         target_ver = self.args.to_version or ""
         if not target_ver:
-            logger.error(
-                "Could not determine target version. Please specify a --to <version>."
-            )
+            logger.error("Could not determine target version. Please specify a --to <version>.")
             return None
 
         project_path = Path(self.args.path).resolve()
@@ -313,13 +290,10 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         for repo in odoo_repositories(enterprise=True):
             path_mapping[str(repo.path.resolve())] = f"/repositories/{repo.path.name}"
 
-
         def map_path(p: Path | str) -> str:
             p_str = str(p)
             # Sort by length descending to match longest prefix first
-            for host, guest in sorted(
-                path_mapping.items(), key=lambda x: len(x[0]), reverse=True
-            ):
+            for host, guest in sorted(path_mapping.items(), key=lambda x: len(x[0]), reverse=True):
                 if p_str.startswith(host):
                     return p_str.replace(host, guest)
             return p_str
@@ -360,9 +334,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         modules_info = self._get_sorted_modules(search_paths)
 
         if not modules_info:
-            logger.error(
-                f"No modules found in search paths: {[str(p) for p in search_paths]}"
-            )
+            logger.error(f"No modules found in search paths: {[str(p) for p in search_paths]}")
             return None
 
         # Manage Odoo Upgrade (migration scripts) repository
@@ -389,9 +361,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             # Only resolve path if worktree already exists to avoid auto-triggering creation
             if (worktrees_path / from_ver).exists():
                 from_odoo_path = str(worktrees_path / from_ver)
-                extra_bind_dirs.append(
-                    f"{worktrees_path}/{from_ver}:{worktrees_path}/{from_ver}"
-                )
+                extra_bind_dirs.append(f"{worktrees_path}/{from_ver}:{worktrees_path}/{from_ver}")
             else:
                 from_odoo_path = f"Virtual (Ref: {from_ver} in Target Odoo)"
         except Exception:
@@ -399,14 +369,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         try:
             target_odoo_path = str(worktrees_path / target_ver)
-            extra_bind_dirs.append(
-                f"{worktrees_path}/{target_ver}:{worktrees_path}/{target_ver}"
-            )
+            extra_bind_dirs.append(f"{worktrees_path}/{target_ver}:{worktrees_path}/{target_ver}")
         except Exception:
             target_odoo_path = str(worktrees_path / target_ver)
-            extra_bind_dirs.append(
-                f"{worktrees_path}/{target_ver}:{worktrees_path}/{target_ver}"
-            )
 
         # --- Knowledge Index integration -------------------------------------------
         from odev.common.store.datastore import DataStore
@@ -428,9 +393,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 # Resolve standard (community/enterprise) deps — NOT the custom modules
                 standard_deps = self._resolve_standard_deps(modules_info, from_ver)
                 if standard_deps:
-                    logger.info(
-                        f"Knowledge index: tracking {len(standard_deps)} standard Odoo module dependencies."
-                    )
+                    logger.info(f"Knowledge index: tracking {len(standard_deps)} standard Odoo module dependencies.")
                 else:
                     logger.warning(
                         "Knowledge index: no standard Odoo dependencies resolved. "
@@ -449,9 +412,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 if version_pairs and standard_deps:
                     knowledge_context = ki.load_knowledge(standard_deps, version_pairs)
                     if knowledge_context:
-                        logger.info(
-                            "Knowledge index: loaded existing upgrade context for AI prompt."
-                        )
+                        logger.info("Knowledge index: loaded existing upgrade context for AI prompt.")
                     else:
                         logger.info(
                             "Knowledge index: No existing notes found for these modules yet. The AI will discover and record findings during the upgrade."
@@ -483,10 +444,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         # Prepare module context for AI
 
         repo_name = Path(self.args.path).resolve().name
-        is_ps_custom_external = repo_name.startswith("ps") and repo_name.endswith(
-            "-custom"
-        )
-
+        is_ps_custom_external = repo_name.startswith("ps") and repo_name.endswith("-custom")
 
         if is_ps_custom_external:
             fast_verify = "- **Verification (Fast)**: Verify the module installs cleanly using: `odev deploy <module_name>`. (Assume one instance is already running with `odev run`). Then, verify the presence of new fields or view rendering."
@@ -555,13 +513,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if self.args.submodules:
             prompt += "\n- **Submodules Usage**: You are authorized to upgrade modules found in git submodules. Ensure you commit changes within the respective submodule repositories.\n"
 
-        # Add binary skill paths
-        skills_path = Path(__file__).parent.parent / "skills"
-        if skills_path.exists():
-            extra_bind_dirs.append(f"{skills_path.resolve()}:/skills")
-
-        extra_bind_dirs.append(f"{self.odev.worktrees_path}:/worktrees_host")
-
         # Allow the AI to write into the knowledge repo when populating stubs
         if knowledge_local_path:
             sandbox_dirs.append(f"{knowledge_local_path}:/knowledge")
@@ -581,8 +532,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
     @contextmanager
     def _ephemeral_postgresql(self, db_to_clone: str | None = None):
         """Context manager to start and stop an ephemeral PostgreSQL cluster."""
-        import shutil
-
         pg_dir = Path(tempfile.mkdtemp(prefix="odev-pg-"))
         pg_socket = Path(tempfile.mkdtemp(prefix="odev-pg-socket-"))
         pg_log = pg_dir / "postgresql.log"
@@ -590,9 +539,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         try:
             if not self.args.headless:
                 logger.info("Initializing ephemeral PostgreSQL cluster...")
-            subprocess.run(
-                ["initdb", "-D", str(pg_dir)], check=True, capture_output=True
-            )
+            subprocess.run(["initdb", "-D", str(pg_dir)], check=True, capture_output=True)
 
             logger.info("Starting ephemeral PostgreSQL cluster...")
             try:
@@ -617,27 +564,19 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
                 ready = False
                 for _ in range(30):  # 15 seconds max
-                    res = subprocess.run(
-                        ["pg_isready", "-h", str(pg_socket)], capture_output=True
-                    )
+                    res = subprocess.run(["pg_isready", "-h", str(pg_socket)], capture_output=True)
                     if res.returncode == 0:
                         ready = True
                         break
                     time.sleep(0.5)
 
                 if not ready:
-                    log_content = (
-                        pg_log.read_text() if pg_log.exists() else "No log file found."
-                    )
-                    logger.error(
-                        f"Ephemeral PostgreSQL failed to start in time. Log:\n{log_content}"
-                    )
+                    log_content = pg_log.read_text() if pg_log.exists() else "No log file found."
+                    logger.error(f"Ephemeral PostgreSQL failed to start in time. Log:\n{log_content}")
                     raise RuntimeError("PostgreSQL cluster failed to become ready.")
 
             except subprocess.CalledProcessError as e:
-                log_content = (
-                    pg_log.read_text() if pg_log.exists() else "No log file found."
-                )
+                log_content = pg_log.read_text() if pg_log.exists() else "No log file found."
                 logger.error(
                     f"Failed to start ephemeral PostgreSQL cluster: {e.stderr or e.stdout}\nLog:\n{log_content}"
                 )
@@ -645,17 +584,11 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
             # Get existing databases to clone
             res_db = subprocess.run(["psql", "-ltq"], capture_output=True, text=True)
-            existing_dbs = [
-                line.split("|")[0].strip()
-                for line in res_db.stdout.splitlines()
-                if line.strip()
-            ]
+            existing_dbs = [line.split("|")[0].strip() for line in res_db.stdout.splitlines() if line.strip()]
 
             # Clone 'odev' if it exists
             if "odev" in existing_dbs:
-                logger.info(
-                    "Cloning 'odev' database into ephemeral cluster (Sandbox isolation)..."
-                )
+                logger.info("Cloning 'odev' database into ephemeral cluster (Sandbox isolation)...")
                 subprocess.run(["createdb", "-h", str(pg_socket), "odev"], check=True)
                 subprocess.run(
                     f"pg_dump odev | psql -h {pg_socket} -d odev",
@@ -667,12 +600,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
             # Clone target database if specified
             if db_to_clone and db_to_clone in existing_dbs and db_to_clone != "odev":
-                logger.info(
-                    f"Cloning target database {db_to_clone!r} into ephemeral cluster..."
-                )
-                subprocess.run(
-                    ["createdb", "-h", str(pg_socket), db_to_clone], check=False
-                )
+                logger.info(f"Cloning target database {db_to_clone!r} into ephemeral cluster...")
+                subprocess.run(["createdb", "-h", str(pg_socket), db_to_clone], check=False)
                 subprocess.run(
                     f"pg_dump {db_to_clone} | psql -h {pg_socket} -d {db_to_clone}",
                     shell=True,
@@ -685,9 +614,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         finally:
             logger.info("Stopping ephemeral PostgreSQL cluster...")
-            subprocess.run(
-                ["pg_ctl", "-D", str(pg_dir), "stop"], check=False, capture_output=True
-            )
+            subprocess.run(["pg_ctl", "-D", str(pg_dir), "stop"], check=False, capture_output=True)
             shutil.rmtree(pg_dir, ignore_errors=True)
             shutil.rmtree(pg_socket, ignore_errors=True)
 
@@ -730,9 +657,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     try:
                         connector.repository.git.checkout("-b", branch_name)
                     except Exception as e:
-                        raise self.error(
-                            f"Failed to create branch {branch_name!r}: {e}"
-                        )
+                        raise self.error(f"Failed to create branch {branch_name!r}: {e}")
                 else:
                     raise self.error(
                         f"Repository at {repo_path} is on a protected branch ({connector.branch!r}). "
@@ -762,8 +687,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         db_to_clone = (
             self._database.name
-            if getattr(self, "_database", None)
-            and self._database.platform.name != "dummy"
+            if getattr(self, "_database", None) and self._database.platform.name != "dummy"
             else None
         )
 
@@ -774,14 +698,10 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         target_db_obj = LocalDatabase(target_db)
         if not target_db_obj.exists:
             if db_to_clone:
-                logger.info(
-                    f"Cloning host database {db_to_clone!r} to {target_db!r} for upgrade..."
-                )
+                logger.info(f"Cloning host database {db_to_clone!r} to {target_db!r} for upgrade...")
                 self.clone_database(db_to_clone, target_db)
             else:
-                logger.info(
-                    f"Creating empty host database {target_db!r} for upgrade..."
-                )
+                logger.info(f"Creating empty host database {target_db!r} for upgrade...")
                 target_db_obj.create()
 
         logger.info(
@@ -789,17 +709,17 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             f"from {from_ver} to {target_ver} (Target DB: {target_db})"
         )
 
-        agent.run(
+        if not agent.run(
             prompt,
             sandbox_dirs,
             extra_bind_dirs=extra_bind_dirs,
             database=target_db,
             version=target_ver,
             resume=self.args.resume,
-            pg_socket_dir=None,
             path_mapping=path_mapping,
             ephemeral_pg=True,
-        )
+        ):
+            return
 
         # --- Post-Upgrade Test & Fix Loop ---
         modules_to_test = ",".join([m["name"] for m in modules_info])
@@ -828,12 +748,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             import re as _re
 
             # Pattern to match Start of Error/Warning or Traceback
-            error_start_re = _re.compile(
-                r"^(\d{4}-\d{2}-\d{2}\s)?\d{2}:\d{2}:\d{2},\d{3}\s(ERROR|WARNING)"
-            )
-            traceback_start_re = _re.compile(
-                r"^(Traceback \(most recent call last\):|AssertionError:|FAIL:)"
-            )
+            error_start_re = _re.compile(r"^(\d{4}-\d{2}-\d{2}\s)?\d{2}:\d{2}:\d{2},\d{3}\s(ERROR|WARNING)")
+            traceback_start_re = _re.compile(r"^(Traceback \(most recent call last\):|AssertionError:|FAIL:)")
             indent_re = _re.compile(r"^[\s\t]+")
 
             p = subprocess.Popen(
@@ -857,20 +773,14 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     # Strip ANSI colors to avoid confusing the LLM
                     clean_line = _re.sub(r"\x1b[^m]*m", "", line)
 
-                    if error_start_re.search(clean_line) or traceback_start_re.search(
-                        clean_line
-                    ):
+                    if error_start_re.search(clean_line) or traceback_start_re.search(clean_line):
                         is_collecting = True
                         filtered_output.append(clean_line)
                     elif is_collecting and indent_re.search(clean_line):
                         filtered_output.append(clean_line)
                     else:
                         is_collecting = False
-                        if (
-                            " ERROR " in clean_line
-                            or " WARNING " in clean_line
-                            or "Traceback" in clean_line
-                        ):
+                        if " ERROR " in clean_line or " WARNING " in clean_line or "Traceback" in clean_line:
                             filtered_output.append(clean_line)
 
             t1 = threading.Thread(target=stream_pipe, args=(p.stdout, "stdout"))
@@ -893,20 +803,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 test_failures = "".join(filtered_output)
 
                 if not test_failures.strip():
-                    logger.info(
-                        "No explicit ERROR/WARNING caught by filter. Including full output summary instead."
-                    )
-                    test_failures = (
-                        "No tracebacks captured, but exit code was non-zero."
-                    )
+                    logger.info("No explicit ERROR/WARNING caught by filter. Including full output summary instead.")
+                    test_failures = "No tracebacks captured, but exit code was non-zero."
 
                 # Prioritize bottom of the log if still too large
                 if len(test_failures) > 30000:
-                    test_failures = (
-                        test_failures[:5000]
-                        + "\n...[TRUNCATED MID-LOG]...\n"
-                        + test_failures[-25000:]
-                    )
+                    test_failures = test_failures[:5000] + "\n...[TRUNCATED MID-LOG]...\n" + test_failures[-25000:]
 
                 prompt_test = (
                     f"The full test suite execution failed with the following output:\n\n"
@@ -927,7 +829,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     database=target_db,
                     version=target_ver,
                     resume=session_id or "latest",
-                    pg_socket_dir=None,
                     path_mapping=path_mapping,
                     ephemeral_pg=True,
                 )
@@ -967,9 +868,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             "Upgrade session finished. Would you like to launch 'odev test --ai' to verify the upgrade?",
             default=False,
         ):
-            modules = self.args.module_name or ",".join(
-                [m["name"] for m in self._get_sorted_modules([self.args.path])]
-            )
+            modules = self.args.module_name or ",".join([m["name"] for m in self._get_sorted_modules([self.args.path])])
             verify_test_args = f"test --ai {target_db} -V {target_ver} -i {modules}"
             logger.info(f"Launching verification tests: odev {verify_test_args}")
             self.odev.run_command(*verify_test_args.split())
@@ -978,9 +877,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         """Return a list of local databases that look like upgrade databases."""
         return [db for db in self.list_databases() if db.endswith("_upgrade")]
 
-    def _cleanup_wizard(
-        self, stage: str = "post-flight", exclude: list[str] | None = None
-    ) -> None:
+    def _cleanup_wizard(self, stage: str = "post-flight", exclude: list[str] | None = None) -> None:
         """Prompt the user to clean up leftover upgrade databases."""
         upgrade_dbs = self._get_upgrade_databases()
         if exclude:
@@ -989,9 +886,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not upgrade_dbs:
             return
 
-        logger.info(
-            f"\n[{stage}] Found {len(upgrade_dbs)} potential upgrade database(s)."
-        )
+        logger.info(f"\n[{stage}] Found {len(upgrade_dbs)} potential upgrade database(s).")
         to_delete = self.console.checkbox(
             "Select databases to delete:",
             choices=[(db, db) for db in upgrade_dbs],
@@ -1039,9 +934,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                         default=True,
                     ):
                         self.args.no_ruff = True
-                        logger.info(
-                            "Automatic ruff instructions disabled for this session."
-                        )
+                        logger.info("Automatic ruff instructions disabled for this session.")
 
             except Exception as e:
                 logger.debug(f"Ruff cleanliness check failed: {e}")

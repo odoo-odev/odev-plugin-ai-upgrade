@@ -1,3 +1,10 @@
+---
+name: studio_upgrade
+description:
+    "Workflow and technical rules for investigating and fixing Odoo Studio views deactivated during upgrades. Includes
+    research strategies and automated view patching."
+---
+
 # Studio Upgrade Skill
 
 This skill provides mandatory rules and instructions for identifying, investigating, and fixing Odoo Studio views
@@ -64,7 +71,9 @@ Generate a Python migration script that uses the PS Custom `custom_util` library
 
 -   **Batch Updates**: If many views are broken due to the same underlying change, use batch helpers like
     `update_custom_views`.
--   **Atomic Structural Changes**: If a field was renamed or a model refactored in Odoo Core (e.g., `uom.category` removal), ensure ALL affected Studio views are fixed in the same migration script pass. Perform a global analysis of all provided Studio views to identify every instance that needs adjustment before finalizing the script.
+-   **Atomic Structural Changes**: If a field was renamed or a model refactored in Odoo Core (e.g., `uom.category`
+    removal), ensure ALL affected Studio views are fixed in the same migration script pass. Perform a global analysis of
+    all provided Studio views to identify every instance that needs adjustment before finalizing the script.
 -   **Target Custom Modules**: If the Studio customization should be moved to a custom module, use
     `custom_util.transfer_custom_fields`.
 -   **Technical Documentation**: For library help, refer to:

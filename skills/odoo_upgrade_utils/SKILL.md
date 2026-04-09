@@ -1,3 +1,10 @@
+---
+name: odoo_upgrade_utils
+description:
+    "Standard Odoo upgrade helpers for field/model renaming, XMLID management, and view patching. Essential for safe
+    data migrations across Odoo versions."
+---
+
 # Odoo Upgrade Utils Skill
 
 Use the `odoo.upgrade.util` module for safe data migrations. These helpers handle complex database operations and ensure
