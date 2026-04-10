@@ -343,7 +343,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         )
         target_odoo_path = str(worktrees_path / target_ver)
 
-        ki, knowledge_context, knowledge_local_path = self._setup_knowledge_index_context(
+        ki, knowledge_local_path = self._setup_knowledge_index_context(
             modules_info, from_ver, target_ver, upgrade_path, path_mapping
         )
         if knowledge_local_path:
@@ -357,7 +357,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         self._prepare_worktrees([target_ver])
 
         prompt = self._build_final_prompt(
-            from_ver, target_ver, from_odoo_path, target_odoo_path, target_db, upgrade_instructions, knowledge_context
+            from_ver, target_ver, from_odoo_path, target_odoo_path, target_db, upgrade_instructions
         )
 
         return (
@@ -405,8 +405,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         target_ver: str,
         upgrade_path: Path,
         path_mapping: dict[str, str],
-    ) -> tuple["KnowledgeIndex | None", str, str | None]:
-        """Setup KnowledgeIndex and load relevant context."""
+    ) -> tuple["KnowledgeIndex | None", str | None]:
+        """Setup KnowledgeIndex."""
         from odev.common.store.datastore import DataStore
 
         from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import KnowledgeIndex
@@ -425,20 +425,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             else:
                 logger.warning(f"Knowledge index: no standard Odoo dependencies found for {from_ver}.")
 
-            pairs = ki.get_version_pairs(from_ver, target_ver, upgrade_path=upgrade_path, modules=std_deps)
-            context = ki.load_knowledge(std_deps, pairs) if pairs and std_deps else ""
-
-            if context:
-                logger.info("Knowledge index: loaded existing upgrade context for AI prompt.")
-            else:
-                logger.info("Knowledge index: No existing notes found. AI will discover findings.")
-
             local_path = ki.local_path.as_posix()
             path_mapping[local_path] = "/knowledge"
-            return ki, context, local_path
+            return ki, local_path
         except Exception as e:
             logger.warning(f"Knowledge index unavailable: {e}. Proceeding without it.")
-            return None, "", None
+            return None, None
 
     def _build_final_prompt(
         self,
@@ -448,7 +440,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         target_odoo_path: str,
         target_db: str,
         upgrade_instructions: str,
-        knowledge_context: str,
     ) -> str:
         """Compose the full AI prompt from various components."""
         repo_name = Path(self.args.path).resolve().name
@@ -471,9 +462,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not self.args.no_ruff:
             instructions = " You MUST run `ruff check --fix <file>` after editing any Python file."
 
-        knowledge_prefix = f"{knowledge_context}\n\n---\n\n" if knowledge_context else ""
-
-        full_prompt = f"""{knowledge_prefix}You are an expert Odoo Upgrade Lead.
+        full_prompt = f"""You are an expert Odoo Upgrade Lead.
 Your task is to upgrade multiple Odoo modules from version {from_ver} to {target_ver}.
 
 ### Core Protocol:
@@ -486,7 +475,7 @@ Your task is to upgrade multiple Odoo modules from version {from_ver} to {target
 - **Target Odoo**: Version {target_ver} at `{target_odoo_path}`.
 - **Project Root**: `/custom`
 - **Target Database**: `{target_db}` (Use this for all installations and tests).
-- **Upgrade Knowledge Base**: `/knowledge` (Read/Write access).{upgrade_instructions}
+- **Upgrade Knowledge Base**: `/knowledge` (Read/Write access). This directory contains markdown files for standard Odoo modules (e.g., `sale.md`, `account.md`) documented by the upgrade team. Each file contains notes for various version jumps (e.g. `## {from_ver} → {target_ver}`). You MUST read relevant files in `/knowledge` to understand known breaking changes and migration strategies before starting your upgrade work.{upgrade_instructions}
 
 ### Standard Odoo Migration Rules:
 - For Odoo >= 18.0, use `odev upgrade-code --from {from_ver} --to {target_ver} {target_db}`.
