@@ -1,3 +1,3 @@
-from . import studio, upgrade
+from . import upgrade
 
-__all__ = ["studio", "upgrade"]
+__all__ = ["upgrade"]
