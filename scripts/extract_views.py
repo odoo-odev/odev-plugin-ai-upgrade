@@ -43,7 +43,7 @@ def validate_view(view):
 def main(env):
     output_file = os.environ.get("ODEV_STUDIO_OUT_FILE")
     if not output_file:
-        return
+        raise RuntimeError("ODEV_STUDIO_OUT_FILE environment variable is not set")
 
     view_ids = os.environ.get("ODEV_STUDIO_VIEW_IDS", "")
     domain: list[tuple[str, str, object] | str] = [("active", "=", False)]

@@ -257,20 +257,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             str(skills_path): "/skills",
         }
 
-    def _get_map_path_func(self, path_mapping: dict[str, str]):
-        """Return a function that maps host paths to guest paths."""
-
-        def map_path(p: Path | str) -> str:
-            p_str = str(p)
-            # Sort by length descending to match longest prefix first
-            sorted_mappings = sorted(path_mapping.items(), key=lambda x: len(x[0]), reverse=True)
-            for host, guest in sorted_mappings:
-                if p_str.startswith(host):
-                    return p_str.replace(host, guest)
-            return p_str
-
-        return map_path
-
     def _get_sandbox_config(
         self,
         target_ver: str,
@@ -330,7 +316,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         skills_path = (Path(__file__).parent.parent / "skills").resolve()
 
         path_mapping = self._setup_path_mapping(project_path, upgrade_path, skills_path)
-        self._get_map_path_func(path_mapping)
 
         target_db, sandbox_dirs, extra_bind_dirs = self._get_sandbox_config(
             target_ver, project_path, worktrees_path, venvs_path
@@ -414,7 +399,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         try:
             ki = KnowledgeIndex(self.config, DataStore())
             if not ki.ensure_setup():
-                return None, "", None
+                return None, None
 
             with progress.spinner("Syncing upgrade knowledge repository"):
                 ki.clone_or_pull()
