@@ -244,19 +244,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         return from_ver, target_ver
 
-    def _setup_path_mapping(
-        self,
-        project_path: Path,
-        upgrade_path: Path,
-        skills_path: Path,
-    ) -> dict[str, str]:
-        """Map host paths to guest paths for the AI sandbox."""
-        return {
-            str(project_path): "/custom",
-            str(upgrade_path): "/upgrade",
-            str(skills_path): "/skills",
-        }
-
     def _get_sandbox_config(
         self,
         target_ver: str,
@@ -313,9 +300,11 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         worktrees_path = self.odev.worktrees_path.resolve()
         venvs_path = self.odev.venvs_path.resolve()
         upgrade_path = self.config.paths.upgrade.resolve()
-        skills_path = (Path(__file__).parent.parent / "skills").resolve()
 
-        path_mapping = self._setup_path_mapping(project_path, upgrade_path, skills_path)
+        path_mapping = {
+            str(project_path): "/custom",
+            str(upgrade_path): "/upgrade",
+        }
 
         target_db, sandbox_dirs, extra_bind_dirs = self._get_sandbox_config(
             target_ver, project_path, worktrees_path, venvs_path
