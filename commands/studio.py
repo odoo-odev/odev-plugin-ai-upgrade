@@ -30,19 +30,15 @@ class StudioCommand(OdoobinShellCommand, AICommandMixin):
         default="",
     )
 
-    def _run_studio_fix(self) -> None:
-        logger.info(f"Connecting to database {self._database.name} to extract Studio views...")
-
-        # Prepare the script path
+    def _extract_studio_views(self) -> list[dict]:
+        """Run Odoo ORM extraction for Studio views."""
         script_path = Path(__file__).parent.parent / "scripts" / "extract_views.py"
         if not script_path.exists():
             raise self.error(f"Extraction script not found at {script_path}")
 
-        # Temporary file for the output
         with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as tmp:
             out_file = tmp.name
 
-        # Pass parameters via environment variables
         os.environ["ODEV_STUDIO_OUT_FILE"] = out_file
         os.environ["ODEV_STUDIO_VIEW_IDS"] = self.args.view_ids or ""
         self.args.script = str(script_path)
@@ -52,13 +48,12 @@ class StudioCommand(OdoobinShellCommand, AICommandMixin):
                 self.run_script()
 
             if not os.path.exists(out_file):
-                logger.info("No disabled Studio views found (extraction failed to produce output).")
-                return
+                logger.info("No disabled Studio views found (no output).")
+                return []
 
             with open(out_file, "r") as f:
                 data = json.load(f)
         finally:
-            # Clean up
             if os.path.exists(out_file):
                 os.unlink(out_file)
             os.environ.pop("ODEV_STUDIO_OUT_FILE", None)
@@ -70,18 +65,15 @@ class StudioCommand(OdoobinShellCommand, AICommandMixin):
         if not isinstance(data, list):
             raise self.error("Extracted data is not a list.")
 
-        if not data:
-            logger.info("No disabled Studio views found.")
-            return
+        return data
 
-        logger.info(f"Found {len(data)} disabled Studio view(s). Preparing AI Agent...")
-
-        # Setup paths
-        plugin_root = Path(__file__).parent.parent
+    def _get_studio_agent_config(
+        self,
+        data: list[dict],
+        plugin_root: Path,
+    ) -> tuple[str, list[str], list[str]]:
+        """Setup paths and environment for the AI agent."""
         skills_path = (plugin_root / "skills").resolve()
-
-        # Create a temporary directory within the plugin root for the views data.
-        # This keeps it within an area we can mark as a 'workspace' for the AI.
         data_tmp_dir = plugin_root / "tmp"
         data_tmp_dir.mkdir(exist_ok=True)
 
@@ -89,67 +81,73 @@ class StudioCommand(OdoobinShellCommand, AICommandMixin):
             json.dump(data, f, indent=2)
             views_json_path = str(Path(f.name).resolve())
 
-        target_ver = str(getattr(self._database, "version", ""))
         target_dir = str(self.args.path.resolve())
-
-        # Resolve workspaces (The list of directories the AI is allowed to work in)
-        workspaces = [target_dir]
+        workspaces = [target_dir, str(data_tmp_dir.resolve())]
         if skills_path.exists():
             workspaces.append(str(skills_path))
-        workspaces.append(str(data_tmp_dir.resolve()))
 
         extra_bind_dirs = []
+        if skills_path.exists():
+            extra_bind_dirs.append(f"{skills_path}:/home/odev/skills")
+
         if hasattr(self, "odev") and self.odev.worktrees_path.exists():
             extra_bind_dirs.append(str(self.odev.worktrees_path.resolve()))
             workspaces.append(str(self.odev.worktrees_path.resolve()))
 
-        # Resolve target Odoo source paths
+        return views_json_path, workspaces, extra_bind_dirs
+
+    def _resolve_target_odoo_context(
+        self,
+        target_ver: str,
+        extra_bind_dirs: list[str],
+    ) -> tuple[str, list[str]]:
+        """Resolve Odoo source paths and addons for the target version."""
         from odev.common.odoobin import OdoobinProcess
         from odev.common.version import OdooVersion
 
-        target_odoobin = OdoobinProcess(self._database).with_version(OdooVersion(target_ver))
-
-        target_odoopath_host = target_odoobin.odoo_path.resolve()
-        target_odoo_path = "/source"
-
-        # We bind the root of the worktree to /source
-        # Typically target_odoopath_host is /.../worktrees/19.0/odoo
-        # So we bind /.../worktrees/19.0 to /source
-        worktree_root = target_odoopath_host.parent
+        odoobin = OdoobinProcess(self._database).with_version(OdooVersion(target_ver))
+        odoopath_host = odoobin.odoo_path.resolve()
+        worktree_root = odoopath_host.parent
         extra_bind_dirs.append(f"{worktree_root}:/source")
 
-        target_addons_paths = []
+        target_addons = []
         try:
-            for p in target_odoobin.addons_paths:
-                if p.exists():
-                    p_abs = p.resolve()
-                    if p_abs.is_relative_to(worktree_root):
-                        # Use mapped path
-                        rel = p_abs.relative_to(worktree_root)
-                        target_addons_paths.append(f"/source/{rel}")
-                    else:
-                        # Outside worktree, bind separately if needed
-                        target_addons_paths.append(str(p_abs))
-                        if str(p_abs) not in extra_bind_dirs:
-                            extra_bind_dirs.append(str(p_abs))
+            for p in odoobin.addons_paths:
+                if not p.exists():
+                    continue
+                p_abs = p.resolve()
+                if p_abs.is_relative_to(worktree_root):
+                    target_addons.append(f"/source/{p_abs.relative_to(worktree_root)}")
+                else:
+                    target_addons.append(str(p_abs))
+                    if str(p_abs) not in extra_bind_dirs:
+                        extra_bind_dirs.append(str(p_abs))
         except Exception:
-            target_addons_paths = []
+            target_addons = []
 
-        prompt = self._build_prompt(data, views_json_path, "/home/odev/skills", target_odoo_path, target_addons_paths)
-        # Update extra_bind_dirs for skills mapping which is already handled in upgrade command but let's make it explicit here too
-        if skills_path.exists():
-            ks_bind = f"{skills_path}:/home/odev/skills"
-            if ks_bind not in extra_bind_dirs:
-                extra_bind_dirs.append(ks_bind)
+        return "/source", target_addons
+
+    def _run_studio_fix(self) -> None:
+        """Execute the Studio-fix workflow."""
+        logger.info(f"Connecting to database {self._database.name}...")
+        data = self._extract_studio_views()
+        if not data:
+            logger.info("No disabled Studio views found.")
+            return
+
+        logger.info(f"Found {len(data)} disabled Studio view(s). Starting AI...")
+
+        plugin_root = Path(__file__).parent.parent
+        views_json_path, workspaces, extra_bind_dirs = self._get_studio_agent_config(data, plugin_root)
+        target_ver = str(getattr(self._database, "version", "unknown"))
+
+        source_path, target_addons = self._resolve_target_odoo_context(target_ver, extra_bind_dirs)
+        prompt = self._build_prompt(data, views_json_path, "/home/odev/skills", source_path, target_addons)
+
         agent = self.get_ai_agent()
-
         try:
             agent.run(
-                prompt,
-                workspaces,
-                extra_bind_dirs=extra_bind_dirs,
-                database=self._database.name,
-                version=target_ver,
+                prompt, workspaces, extra_bind_dirs=extra_bind_dirs, database=self._database.name, version=target_ver
             )
         finally:
             if os.path.exists(views_json_path):

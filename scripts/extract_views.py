@@ -2,6 +2,44 @@ import json
 import os
 
 
+def get_xml_host_id(env, view):
+    """Return the XML ID for a given view."""
+    ext_ids = view.get_external_id()
+    if ext_ids and ext_ids.get(view.id):
+        return ext_ids.get(view.id)
+
+    data = env["ir.model.data"].search([("model", "=", "ir.ui.view"), ("res_id", "=", view.id)], limit=1)
+    return f"{data.module}.{data.name}" if data else f"__export__.ir_ui_view_{view.id}"
+
+
+def get_parent_chain(env, view):
+    """Recursively extract the parent chain of a view."""
+    chain = []
+    curr = view.inherit_id
+    while curr:
+        chain.append(
+            {
+                "xml_id": get_xml_host_id(env, curr),
+                "name": curr.name,
+                "arch": curr.arch_db,
+            }
+        )
+        curr = curr.inherit_id
+    return chain
+
+
+def validate_view(view):
+    """Try to validate the view arch and return error if any."""
+    try:
+        if hasattr(view, "_check_xml"):
+            view._check_xml()
+        elif hasattr(view, "_validate_view_arch"):
+            view._validate_view_arch()
+    except Exception as e:
+        return str(e)
+    return None
+
+
 def main(env):
     output_file = os.environ.get("ODEV_STUDIO_OUT_FILE")
     if not output_file:
@@ -22,73 +60,26 @@ def main(env):
                     ids_to_search.append(record.id)
             elif v.isdigit():
                 ids_to_search.append(int(v))
-        if ids_to_search:
-            domain.append(("id", "in", ids_to_search))
-        else:
+        if not ids_to_search:
             with open(output_file, "w") as f:
                 json.dump({"error": "No valid views found for provided IDs."}, f)
             return
+        domain.append(("id", "in", ids_to_search))
     else:
-        domain.append("|")
-        domain.append(("name", "ilike", "Odoo Studio"))
-        domain.append(("name", "ilike", "Studio"))
+        domain.extend(["|", ("name", "ilike", "Odoo Studio"), ("name", "ilike", "Studio")])
 
     views = env["ir.ui.view"].with_context(active_test=False).search(domain)
-
     result = []
     for view in views:
-        # Recursive Parent Chain extraction
-        parent_chain = []
-        curr = view.inherit_id
-        while curr:
-            # Try to get XML ID for parent
-            p_xml_id = None
-            p_ext_ids = curr.get_external_id()
-            if p_ext_ids and p_ext_ids.get(curr.id):
-                p_xml_id = p_ext_ids.get(curr.id)
-
-            if not p_xml_id:
-                p_data = env["ir.model.data"].search([("model", "=", "ir.ui.view"), ("res_id", "=", curr.id)], limit=1)
-                p_xml_id = f"{p_data.module}.{p_data.name}" if p_data else f"__export__.ir_ui_view_{curr.id}"
-
-            parent_chain.append(
-                {
-                    "xml_id": p_xml_id,
-                    "name": curr.name,
-                    "arch": curr.arch_db,
-                }
-            )
-            curr = curr.inherit_id
-
-        # Try to get a real XML ID for current view
-        xml_id = None
-        ext_ids = view.get_external_id()
-        if ext_ids and ext_ids.get(view.id):
-            xml_id = ext_ids.get(view.id)
-
-        if not xml_id:
-            data = env["ir.model.data"].search([("model", "=", "ir.ui.view"), ("res_id", "=", view.id)], limit=1)
-            xml_id = f"{data.module}.{data.name}" if data else f"__export__.ir_ui_view_{view.id}"
-
-        # Capture validation error
-        validation_error = None
-        try:
-            if hasattr(view, "_check_xml"):
-                view._check_xml()
-            elif hasattr(view, "_validate_view_arch"):
-                view._validate_view_arch()
-        except Exception as e:
-            validation_error = str(e)
-
         result.append(
             {
                 "id": view.id,
-                "xml_id": xml_id,
+                "xml_id": get_xml_host_id(env, view),
                 "name": view.name,
                 "model": view.model,
                 "arch": view.arch_db,
-                "parent_chain": parent_chain,
-                "error": validation_error,
+                "parent_chain": get_parent_chain(env, view),
+                "validation_error": validate_view(view),
             }
         )
 

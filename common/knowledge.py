@@ -263,7 +263,7 @@ class KnowledgeIndex:
             in_range.insert(0, start_ov)
         if end_ov not in in_range:
             in_range.append(end_ov)
-        in_range = sorted(list(set(in_range)))
+        in_range = sorted(set(in_range))
 
         # Global sequence of consecutive release pairs
         global_steps = []
