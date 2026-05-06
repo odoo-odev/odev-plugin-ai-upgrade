@@ -320,7 +320,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if knowledge_local_path:
             sandbox_dirs.append(knowledge_local_path)
 
-        if (self.args.path / "UPGRADE.md").exists():
+        upgrade_report_exists = (self.args.path / "UPGRADE.md").exists()
+        if upgrade_report_exists:
             logger.info(f"Existing upgrade report found at {self.args.path / 'UPGRADE.md'}")
 
         # Prepare environment for required versions.
@@ -335,6 +336,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             upgrade_instructions,
             knowledge_local_path,
             modules_info,
+            upgrade_report_exists,
         )
 
         return (
@@ -407,6 +409,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         upgrade_instructions: str,
         knowledge_path: str | None,
         modules_info: list[dict],
+        upgrade_report_exists: bool = False,
     ) -> str:
         """Compose the full AI prompt from various components."""
         project_path = Path(self.args.path).resolve()
@@ -432,6 +435,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             comment=self.args.comment,
             submodules=self.args.submodules,
             modules=modules_info,
+            upgrade_report_exists=upgrade_report_exists,
         )
 
     def _check_git_safety(self, repo_path: Path):
@@ -466,31 +470,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 raise self.error(f"Failed to create branch {branch_name!r}: {e}")
         else:
             raise self.error(f"Protected branch {connector.branch!r} detected. Feature branch required.")
-
-    def _verification_loop(self, agent, modules_to_test: str, target_db: str, target_ver: str, tour: bool = False):
-        """Run verification tests and offer AI-fixes in a loop."""
-        session_id = (self.args.resume or agent.get_latest_session_id()) if agent else None
-        test_type = "tour" if tour else "full"
-        prompt_msg = f"Would you like to run the {test_type} test suite for analysis? (Modules: {modules_to_test})"
-        while self.console.confirm(prompt_msg, default=True):
-            test_args = ["test", "--ai", target_db, "-V", target_ver, "-i", modules_to_test]
-            if tour:
-                # Use click_all tag and ensure headless chrome with necessary flags for sandbox stability
-                test_args.extend(
-                    [
-                        "-t",
-                        "click_all",
-                        "--odoo-args",
-                        "--chrome-args='--headless --no-sandbox --disable-gpu'",
-                    ]
-                )
-            if session_id:
-                test_args.extend(["--resume", session_id])
-
-            logger.info(f"Launching {test_type} verification tests: odev {' '.join(test_args)}")
-            self.odev.run_command(*test_args)
-            if agent:
-                session_id = agent.get_latest_session_id() or session_id
 
     def _sync_knowledge(self, ki, from_ver: str, target_ver: str):
         """Sync findings back to the knowledge repo as a PR."""
@@ -546,9 +525,14 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if missing:
             logger.warning(
                 f"Missing upgrade skills: {', '.join(missing)}. "
-                "To load them, run: npx skills add odoo-ps/ps-ai-skills --skills odoo_upgrade_utils,custom_util"
+                "To load them, run: npx -y skills add odoo-ps/ps-ai-skills --skills odoo_upgrade_utils,custom_util"
             )
 
+        clone_from = (
+            self._database.name
+            if getattr(self, "_database", None) and self._database.platform.name != "dummy"
+            else None
+        )
         if not agent.run(
             prompt,
             sandbox_dirs,
@@ -556,12 +540,10 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             database=target_db,
             version=target_ver,
             resume=self.args.resume,
+            clone_from=clone_from,
         ):
             return
 
-        modules_to_test = ",".join([m["name"] for m in modules_info])
-        self._verification_loop(agent, modules_to_test, target_db, target_ver)
-        self._verification_loop(agent, modules_to_test, target_db, target_ver, tour=True)
         self._sync_knowledge(ki, from_ver, target_ver)
 
     def _get_upgrade_databases(self) -> list[str]:
