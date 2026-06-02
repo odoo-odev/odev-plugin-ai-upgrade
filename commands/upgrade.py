@@ -467,21 +467,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         else:
             raise self.error(f"Protected branch {connector.branch!r} detected. Feature branch required.")
 
-    def _verification_loop(self, agent, modules_to_test: str, target_db: str, target_ver: str):
-        """Run verification tests and offer AI-fixes in a loop."""
-        session_id = (self.args.resume or agent.get_latest_session_id()) if agent else None
-        while self.console.confirm(
-            f"Would you like to run the full test suite for analysis? (Modules: {modules_to_test})",
-            default=True,
-        ):
-            test_args = ["test", "--ai", target_db, "-V", target_ver, "-i", modules_to_test]
-            if session_id:
-                test_args.extend(["--resume", session_id])
-
-            logger.info(f"Launching verification tests: odev {' '.join(test_args)}")
-            self.odev.run_command(*test_args)
-            if agent:
-                session_id = agent.get_latest_session_id() or session_id
 
     def _sync_knowledge(self, ki, from_ver: str, target_ver: str):
         """Sync findings back to the knowledge repo as a PR."""
