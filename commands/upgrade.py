@@ -414,7 +414,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         is_ps_custom = repo_name.startswith("ps") and repo_name.endswith("-custom")
 
         template_path = Path(__file__).parent.parent / "templates" / "upgrade_prompt.md.j2"
-        with open(template_path, "r", encoding="utf-8") as f:
+        with open(template_path, encoding="utf-8") as f:
             template_content = f.read()
 
         template = jinja2.Template(template_content)
@@ -467,7 +467,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         else:
             raise self.error(f"Protected branch {connector.branch!r} detected. Feature branch required.")
 
-
     def _sync_knowledge(self, ki, from_ver: str, target_ver: str):
         """Sync findings back to the knowledge repo as a PR."""
         if not (ki and ki.is_configured()):
@@ -507,7 +506,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             target_ver,
             target_db,
             ki,
-            modules_info,
+            _modules_info,
         ) = prepared
         self._target_db = target_db
         agent = self.get_ai_agent()
@@ -577,6 +576,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             try:
                 diff_process = subprocess.run(
                     ["ruff", "check", str(repo_path), "--diff", "--exit-zero"],
+                    check=False,
                     capture_output=True,
                     text=True,
                 )

@@ -52,10 +52,10 @@ class KnowledgeIndex:
     Usage::
 
         ki = KnowledgeIndex(config, store)
-        ki.ensure_setup()          # runs first-time wizard if not configured
-        ki.clone_or_pull()         # sync from remote via GitConnector
+        ki.ensure_setup()  # runs first-time wizard if not configured
+        ki.clone_or_pull()  # sync from remote via GitConnector
         pairs = ki.get_version_pairs("17.0", "19.0")  # [("17.0","18.0"),("18.0","19.0")]
-        missing = ki.get_missing_entries(["sale","stock"], pairs)
+        missing = ki.get_missing_entries(["sale", "stock"], pairs)
         ki.create_stub_entries(missing)
         context = ki.load_knowledge(["sale"], pairs)  # compact markdown for AI prompt
         ki.commit_and_pr("odev/upgrade-knowledge-17-19", "feat: add sale knowledge")
@@ -184,7 +184,7 @@ class KnowledgeIndex:
             return False
 
         self._knowledge_config.repo_url = repo_url
-        logger.info(f"Knowledge index configured. Repository will be cloned to: " f"{GitConnector(repo_url).path}")
+        logger.info(f"Knowledge index configured. Repository will be cloned to: {GitConnector(repo_url).path}")
         return True
 
     # ------------------------------------------------------------------
@@ -232,12 +232,10 @@ class KnowledgeIndex:
             return {}
 
         # 1. Base consecutive pairs (major only) as fallback
-        major_pairs = []
-        for v in range(start_ov.major, end_ov.major):
-            major_pairs.append((f"{v}.0", f"{v + 1}.0"))
+        major_pairs = [(f"{v}.0", f"{v + 1}.0") for v in range(start_ov.major, end_ov.major)]
 
         if not available_versions or not upgrade_path or not modules:
-            return {mod: major_pairs for mod in (modules or {"_": ""})}
+            return dict.fromkeys(modules or {"_": ""}, major_pairs)
 
         # 2. Advanced discovery: include SaaS versions if scripts exist
         ov_all = sorted(OdooVersion(v) for v in available_versions)
@@ -252,9 +250,7 @@ class KnowledgeIndex:
         in_range = sorted(set(in_range))
 
         # Global sequence of consecutive release pairs
-        global_steps = []
-        for i in range(len(in_range) - 1):
-            global_steps.append((str(in_range[i]), str(in_range[i + 1])))
+        global_steps = [(str(in_range[i]), str(in_range[i + 1])) for i in range(len(in_range) - 1)]
 
         module_pairs = {}
         for mod in modules:
