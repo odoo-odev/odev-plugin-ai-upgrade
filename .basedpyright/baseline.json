@@ -1,0 +1,86 @@
+{
+  "files": {
+    "./commands/upgrade.py": [
+      {
+        "code": "reportIncompatibleVariableOverride",
+        "range": {
+          "endColumn": 20,
+          "lineCount": 1,
+          "startColumn": 6
+        }
+      },
+      {
+        "code": "reportIncompatibleVariableOverride",
+        "range": {
+          "endColumn": 20,
+          "lineCount": 1,
+          "startColumn": 6
+        }
+      },
+      {
+        "code": "reportIncompatibleVariableOverride",
+        "range": {
+          "endColumn": 20,
+          "lineCount": 1,
+          "startColumn": 6
+        }
+      },
+      {
+        "code": "reportReturnType",
+        "range": {
+          "endColumn": 45,
+          "lineCount": 1,
+          "startColumn": 31
+        }
+      },
+      {
+        "code": "reportOptionalMemberAccess",
+        "range": {
+          "endColumn": 54,
+          "lineCount": 1,
+          "startColumn": 51
+        }
+      },
+      {
+        "code": "reportArgumentType",
+        "range": {
+          "endColumn": 69,
+          "lineCount": 1,
+          "startColumn": 62
+        }
+      },
+      {
+        "code": "reportAttributeAccessIssue",
+        "range": {
+          "endColumn": 59,
+          "lineCount": 1,
+          "startColumn": 47
+        }
+      },
+      {
+        "code": "reportAttributeAccessIssue",
+        "range": {
+          "endColumn": 59,
+          "lineCount": 1,
+          "startColumn": 47
+        }
+      },
+      {
+        "code": "reportAttributeAccessIssue",
+        "range": {
+          "endColumn": 59,
+          "lineCount": 1,
+          "startColumn": 47
+        }
+      },
+      {
+        "code": "reportOptionalMemberAccess",
+        "range": {
+          "endColumn": 40,
+          "lineCount": 1,
+          "startColumn": 37
+        }
+      }
+    ]
+  }
+}
