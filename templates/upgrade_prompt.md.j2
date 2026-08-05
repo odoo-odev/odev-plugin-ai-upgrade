@@ -21,20 +21,18 @@ Upgrade modules from {{ from_ver }} to {{ target_ver }}.
 
 ### Outside your reach (do NOT claim these are done):
 You are working from module **source only** — no customer database is provisioned to this run. The following customisation lives in the database and you can neither see nor migrate it:
-- Studio views (`ir_ui_view.arch_db`, `studio_customization` records), including ones the upgrade deactivates
-- website views customised on write (cowed)
-- Studio-authored automations and server actions
-- `mail.template` records edited in the database
-- saved filters (`ir_filters`)
+{% for area in unreachable_customisation %}
+- {{ area }}
+{%- endfor %}
 
-These are the most common source of post-upgrade regressions, and they are invisible from here. So: never describe the upgrade as complete or verified. In `UPGRADE.md`, list them under "Not verified by this run" and name the models and reports you touched that most likely carry such customisation, so a human can check them against the real database.
+These are the most common source of post-upgrade regressions, and they are invisible from here. So: never describe the upgrade as complete or verified. `odev` appends its own "Not verified by this run" section to `UPGRADE.md` — do not write that section yourself. Instead add a **`## Manual checks required`** section naming the models, views and reports you touched that most likely carry such customisation, so a human can check them against the real database.
 
 ### WORKFLOW:
 Refer to the `odoo_upgrade_skill` for the strict step-by-step upgrade workflow and follow it for EACH module.
 
 ### Verification rules (they fail silently — install and tests stay green):
-- **Resolve every `Source:` SHA** you cite: `git -C {{ target_odoo_path }} cat-file -e <sha>^{commit}`. If you cannot find the originating commit, write `Source: not identified` and name the core file/symbol you compared against instead. Never write a SHA you have not resolved — an unverifiable citation is worse than none, and a post-flight gate rejects it.
-- **Override boundaries**: match the target's signature exactly (`grep -rn "def <method>" {{ target_odoo_path }}/addons/<app>/models/ -A3`) — never add, drop or rename a parameter you have not seen upstream. **Never reduce an override to a bare `super()` call**: if the customisation is genuinely obsolete, delete the method entirely and cite the commit that made it redundant. A stub that keeps the signature while dropping the body reads as intentional and silently removes a customer feature.
+- **Resolve every `Source:` SHA** you cite. `{{ target_odoo_path }}` is a container, not a repository — the checkouts are `{{ target_odoo_path }}/odoo` and `{{ target_odoo_path }}/enterprise`. So: `git -C {{ target_odoo_path }}/odoo cat-file -e <sha>^{commit}` (or `/enterprise`). Quote the **full 40-character** SHA, not an abbreviation. If you cannot find the originating commit, write `Source: not identified` and name the core file/symbol you compared against instead. Never write a SHA you have not resolved — an unverifiable citation is worse than none, and a post-flight gate rejects it.
+- **Override boundaries**: match the target's signature exactly — community `grep -rn "def <method>" {{ target_odoo_path }}/odoo/addons/<app>/models/ -A3`, enterprise `{{ target_odoo_path }}/enterprise/<module>/models/` (enterprise has no `addons/` level). Never add, drop or rename a parameter you have not seen upstream. **Never reduce an override to a bare `super()` call**: if the customisation is genuinely obsolete, delete the method entirely and cite the commit that made it redundant. A stub that keeps the signature while dropping the body reads as intentional and silently removes a customer feature.
 - **Compute methods**: every dependency path must resolve on the model, and a stored compute must declare dependencies. In a compute loop assign to the loop variable, never to `self`.
 - **No unverified claims**: write "verified" / "tested" / "confirmed" only for a check you actually ran, and name it. A manifest bump is a manifest bump.
 

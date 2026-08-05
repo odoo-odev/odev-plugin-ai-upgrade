@@ -4,6 +4,7 @@ Framework-free: renders the template directly with Jinja2, mirroring
 ``commands/upgrade.py::_build_final_prompt``.
 """
 
+import re
 from pathlib import Path
 
 import jinja2
@@ -15,6 +16,17 @@ def _plugin_root() -> Path:
         if (parent / "__manifest__.py").exists():
             return parent
     raise RuntimeError("Could not locate the plugin root (no __manifest__.py found).")
+
+
+def _unreachable_customisation() -> tuple[str, ...]:
+    """Read the tuple the command passes in, without importing the odev-bound module."""
+    source = (_plugin_root() / "commands" / "upgrade.py").read_text(encoding="utf-8")
+    match = re.search(r"UNREACHABLE_CUSTOMISATION: tuple\[str, \.\.\.\] = \((.*?)\n\)", source, re.DOTALL)
+    assert match, "UNREACHABLE_CUSTOMISATION not found in commands/upgrade.py"
+    return tuple(re.findall(r'"([^"]+)"', match.group(1)))
+
+
+UNREACHABLE_CUSTOMISATION = _unreachable_customisation()
 
 
 def _render(**overrides) -> str:
@@ -34,6 +46,7 @@ def _render(**overrides) -> str:
         "comment": "",
         "submodules": False,
         "modules": [{"name": "sale_x", "path": "/proj/sale_x"}],
+        "unreachable_customisation": UNREACHABLE_CUSTOMISATION,
     }
     context.update(overrides)
     return template.render(**context)
@@ -56,6 +69,13 @@ def test_each_unreachable_area_is_named(area):
     assert area in _render()
 
 
+def test_unreachable_list_comes_from_the_command_not_a_hardcoded_copy():
+    """The command owns the list; the template must render whatever it is given."""
+    out = _render(unreachable_customisation=("a wholly invented area",))
+    assert "a wholly invented area" in out
+    assert "ir_filters" not in out
+
+
 def test_completeness_claims_are_forbidden():
     out = _render()
     assert "never describe the upgrade as complete or verified" in out
@@ -72,8 +92,23 @@ def test_source_sha_must_be_resolved():
     assert "Never write a SHA you have not resolved" in out
 
 
-def test_target_path_is_interpolated_into_the_resolve_command():
-    assert "git -C /wt/19.0 cat-file -e" in _render(target_odoo_path="/wt/19.0")
+def test_resolve_command_points_at_the_repo_not_the_container():
+    """target_odoo_path is a container of checkouts; `git -C` on it always fails."""
+    out = _render(target_odoo_path="/wt/19.0")
+    assert "git -C /wt/19.0/odoo cat-file -e" in out
+    assert "git -C /wt/19.0 cat-file -e" not in out
+
+
+def test_grep_paths_include_the_repo_level():
+    out = _render(target_odoo_path="/wt/19.0")
+    assert "/wt/19.0/odoo/addons/" in out
+    assert "/wt/19.0/addons/" not in out
+
+
+def test_agent_is_told_not_to_write_the_generated_section():
+    out = _render()
+    assert "do not write that section yourself" in out
+    assert "## Manual checks required" in out
 
 
 # --- override boundaries -----------------------------------------------------

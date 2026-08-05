@@ -18,10 +18,11 @@ from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
 from odev.plugins.odev_plugin_ai_upgrade.common.gates import (
-    MIN_SHA_LENGTH,
     dead_tokens_for,
     gutted_overrides,
+    is_git_repo,
     iter_cited_shas,
+    worktree_for,
 )
 
 
@@ -459,6 +460,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             comment=self.args.comment,
             submodules=self.args.submodules,
             modules=modules_info,
+            unreachable_customisation=UNREACHABLE_CUSTOMISATION,
         )
 
     def _check_git_safety(self, repo_path: Path):
@@ -596,30 +598,40 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 logger.info(f"Dropping database {db_name!r}...")
                 db.drop()
 
-    def _git_output(self, repo_path: Path, *git_args: str) -> str:
+    def _git(self, repo_path: Path, *git_args: str) -> tuple[int, str]:
+        """Run git in ``repo_path`` and return ``(returncode, stdout)``.
+
+        ``core.quotePath=false`` keeps non-ASCII paths verbatim, and undecodable
+        bytes are replaced rather than raising - a single legacy-encoded file must
+        not disable a gate.
+        """
         result = subprocess.run(  # noqa: S603
-            ["git", "-C", str(repo_path), *git_args],  # noqa: S607
+            ["git", "-C", str(repo_path), "-c", "core.quotePath=false", *git_args],  # noqa: S607
             check=False,
             capture_output=True,
             text=True,
+            errors="replace",
         )
-        return result.stdout
+        return result.returncode, result.stdout
+
+    def _git_output(self, repo_path: Path, *git_args: str) -> str:
+        """Return git's stdout, or an empty string when the command failed."""
+        code, out = self._git(repo_path, *git_args)
+        return out if code == 0 else ""
 
     def _changed_files(self, repo_path: Path) -> list[str]:
-        """Files the run changed, relative to the pre-run HEAD."""
+        """Files the run changed, relative to the pre-run HEAD.
+
+        NUL-delimited: a path may contain spaces or newlines.
+        """
         if not self._base_sha:
             return []
-        return self._git_output(repo_path, "diff", "--name-only", self._base_sha, "HEAD").split()
+        out = self._git_output(repo_path, "diff", "-z", "--name-only", self._base_sha, "HEAD")
+        return [path for path in out.split("\0") if path]
 
     def _rev_exists(self, worktree: Path, sha: str) -> bool:
-        return (
-            subprocess.run(  # noqa: S603
-                ["git", "-C", str(worktree), "cat-file", "-e", f"{sha}^{{commit}}"],  # noqa: S607
-                check=False,
-                capture_output=True,
-            ).returncode
-            == 0
-        )
+        code, _ = self._git(worktree, "cat-file", "-e", f"{sha}^{{commit}}")
+        return code == 0
 
     def _gate_source_shas(self, repo_path: Path, target_ver: str) -> list[str]:
         """Every ``Source:`` SHA must resolve in a provisioned worktree.
@@ -630,23 +642,28 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not self._base_sha:
             return []
 
-        worktrees = {
-            "odoo": self.odev.worktrees_path / target_ver,
-            "enterprise": self.odev.worktrees_path / target_ver / "enterprise",
-        }
-        log = self._git_output(repo_path, "log", f"{self._base_sha}..HEAD", "--format=%H%x1f%B%x1e")
+        worktrees = {repo: worktree_for(self.odev.worktrees_path, target_ver, repo) for repo in ("odoo", "enterprise")}
+        missing = sorted(repo for repo, path in worktrees.items() if not is_git_repo(path))
+
+        # NUL-delimited records: a commit body can contain any other byte.
+        log = self._git_output(repo_path, "log", "-z", f"{self._base_sha}..HEAD", "--format=%H%x1f%B")
 
         findings: list[str] = []
-        for entry in filter(None, (e.strip() for e in log.split("\x1e"))):
+        unverifiable = 0
+        for entry in filter(None, (e.strip() for e in log.split("\0"))):
             sha, _, body = entry.partition("\x1f")
             for repo, cited in iter_cited_shas(body):
-                worktree = worktrees.get(repo)
-                if worktree is None or not worktree.exists():
-                    continue
-                if len(cited) < MIN_SHA_LENGTH:
-                    findings.append(f"{sha[:8]} cites {cited} ({repo}): too short to be unambiguous")
-                elif not self._rev_exists(worktree, cited):
-                    findings.append(f"{sha[:8]} cites {cited} ({repo}): no such commit")
+                if repo in missing:
+                    unverifiable += 1
+                elif not self._rev_exists(worktrees[repo], cited):
+                    # `cat-file -e` also fails an ambiguous abbreviation, so no
+                    # separate length rule is needed - and none is applied, since
+                    # legitimate citations are often abbreviated.
+                    findings.append(f"{sha[:8]} cites {cited} ({repo}): does not resolve")
+
+        if unverifiable:
+            # Never report a silent pass: say the gate could not run.
+            findings.append(f"{unverifiable} citation(s) not checked: no {'/'.join(missing)} worktree for {target_ver}")
         return findings
 
     def _gate_dead_tokens(self, repo_path: Path, target_ver: str) -> list[str]:
@@ -661,9 +678,16 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             return []
 
         findings: list[str] = []
-        for token, (_gone_at, hint) in tokens.items():
-            hits = self._git_output(repo_path, "grep", "-lF", "-e", token, "--", *changed).split()
-            findings.extend(f"{path}: {token!r} survives ({hint})" for path in hits)
+        for token, (_gone_at, hint, suffixes) in tokens.items():
+            paths = [p for p in changed if p.endswith(suffixes)]
+            if not paths:
+                continue
+            # ':(literal)' stops a path such as `foo[1].xml` being read as a glob.
+            pathspecs = [f":(literal){path}" for path in paths]
+            out = self._git_output(repo_path, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs)
+            findings.extend(
+                f"{hit.removeprefix('HEAD:')}: {token!r} survives ({hint})" for hit in out.split("\0") if hit
+            )
         return findings
 
     def _gate_gutted_overrides(self, repo_path: Path, target_ver: str) -> list[str]:
@@ -676,6 +700,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         for path in (p for p in self._changed_files(repo_path) if p.endswith(".py")):
             before = self._git_output(repo_path, "show", f"{self._base_sha}:{path}")
             after = self._git_output(repo_path, "show", f"HEAD:{path}")
+            if not before or not after:  # added or deleted by the run
+                continue
             findings.extend(f"{path}::{finding}" for finding in gutted_overrides(before, after))
         return findings
 
@@ -704,30 +730,40 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         )
 
         report = repo_path / "UPGRADE.md"
-        existing = report.read_text(encoding="utf-8") if report.exists() else ""
-        if COVERAGE_BEGIN in existing and COVERAGE_END in existing:
-            head, _, rest = existing.partition(COVERAGE_BEGIN)
-            _, _, tail = rest.partition(COVERAGE_END)
-            updated = f"{head}{section}{tail}"
+        existing = report.read_text(encoding="utf-8", errors="replace") if report.exists() else ""
+        begin, end = existing.find(COVERAGE_BEGIN), existing.find(COVERAGE_END)
+        if begin != -1 and end > begin:
+            updated = f"{existing[:begin]}{section}{existing[end + len(COVERAGE_END) :]}"
+        elif begin != -1 or end != -1:
+            # Malformed or hand-edited markers: appending is safe, rewriting is not.
+            logger.warning(f"Coverage markers in {report} are malformed; appending a new section instead.")
+            updated = f"{existing.rstrip()}\n\n{section}\n"
         else:
             updated = f"{existing.rstrip()}\n\n{section}\n" if existing else f"{section}\n"
         report.write_text(updated, encoding="utf-8")
-        logger.info(f"Coverage section written to {report}")
+        logger.info(f"Coverage section written to {report} (uncommitted).")
 
     def _post_flight_gates(self, repo_path: Path, target_ver: str) -> None:
         """Verify the run's own output. Source-only: no database is required."""
+        if not self._base_sha:
+            logger.warning(
+                f"Post-flight gates skipped: could not resolve the pre-run HEAD of {repo_path}. "
+                "Citations, dead tokens and gutted overrides were NOT checked."
+            )
+            return
+
         findings: list[str] = []
         with progress.spinner("Running post-flight gates"):
             for gate in (self._gate_source_shas, self._gate_dead_tokens, self._gate_gutted_overrides):
                 try:
                     findings.extend(gate(repo_path, target_ver))
                 except Exception as e:  # noqa: BLE001 - a broken gate must not abort the run
-                    logger.debug(f"Gate {gate.__name__} failed: {e}")
+                    logger.warning(f"Gate {gate.__name__} did not complete, its findings are missing: {e}")
 
         try:
             self._write_coverage_report(repo_path, findings)
         except OSError as e:
-            logger.debug(f"Could not write the coverage section: {e}")
+            logger.warning(f"Could not write the coverage section: {e}")
 
         if not findings:
             logger.info("Post-flight gates passed.")
@@ -736,7 +772,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         listing = "\n".join(f"  - {finding}" for finding in findings)
         message = f"{len(findings)} post-flight gate finding(s):\n{listing}"
         if self.args.strict_gates:
-            raise self.error(message)
+            # Deliberately before the knowledge sync: that harvests `Source:` SHAs,
+            # and an unresolvable citation must not reach the knowledge base.
+            raise self.error(f"{message}\nKnowledge sync skipped. Re-run without --strict-gates to sync anyway.")
         logger.warning(message)
 
     def _check_ruff_cleanliness(self, repo_path: Path):
