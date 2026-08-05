@@ -1,8 +1,7 @@
-"""Pure helpers for the post-flight gates, free of odev imports so they stay unit-testable."""
+"""Citation parsing, version comparison and AST inspection used by the post-flight gates."""
 
 import ast
 import re
-from pathlib import Path
 
 
 # Tokens removed upstream: any survivor at or after ``gone_at`` is a defect.
@@ -53,20 +52,6 @@ def dead_tokens_for(target_ver: str) -> dict[str, tuple[str, str, tuple[str, ...
     """Return the tokens that must no longer appear when migrating to ``target_ver``."""
     target = version_key(target_ver)
     return {token: meta for token, meta in DEAD_TOKENS.items() if target >= version_key(meta[0])}
-
-
-def worktree_for(worktrees_path: Path, version: str, repo: str) -> Path:
-    """Return the git repository path for ``repo`` inside a version worktree.
-
-    The version directory is a container holding one checkout per repository
-    (``odoo``, ``enterprise``, ``design-themes``); it is not itself a repository.
-    """
-    return Path(worktrees_path) / version / repo
-
-
-def is_git_repo(path: Path) -> bool:
-    """Whether ``path`` is a git checkout (a worktree carries a ``.git`` file)."""
-    return (path / ".git").exists()
 
 
 def function_bodies(source: str) -> dict[str, tuple[int, bool]]:

@@ -7,22 +7,26 @@ from typing import TYPE_CHECKING
 
 import jinja2
 import networkx as nx
+from git import BadName, GitCommandError, Repo
 
 from odev.common import args, progress
 from odev.common.commands import DatabaseCommand
 from odev.common.connectors import GitConnector
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
-from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
+from odev.common.odoobin import (
+    ODOO_COMMUNITY_REPOSITORIES,
+    ODOO_ENTERPRISE_REPOSITORIES,
+    ODOO_UPGRADE_REPOSITORY,
+    OdoobinProcess,
+)
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
 from odev.plugins.odev_plugin_ai_upgrade.common.gates import (
     dead_tokens_for,
     gutted_overrides,
-    is_git_repo,
     iter_cited_shas,
-    worktree_for,
 )
 
 
@@ -538,7 +542,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             _modules_info,
         ) = prepared
         self._target_db = target_db
-        self._base_sha = self._git_output(repo_path, "rev-parse", "HEAD").strip() or None
+        repository = self._repository(repo_path)
+        self._base_sha = repository.head.commit.hexsha if repository and repository.head.is_valid() else None
         agent = self.get_ai_agent()
 
         self._cleanup_wizard(stage="pre-flight", exclude=[target_db])
@@ -598,82 +603,99 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 logger.info(f"Dropping database {db_name!r}...")
                 db.drop()
 
-    def _git(self, repo_path: Path, *git_args: str) -> tuple[int, str]:
-        """Run git in ``repo_path`` and return ``(returncode, stdout)``.
+    def _repository(self, repo_path: Path) -> "Repo | None":
+        """The project's git repository, via the connector the command already uses."""
+        connector = GitConnector(str(repo_path))
+        return connector.repository if connector.exists else None
 
-        ``core.quotePath=false`` keeps non-ASCII paths verbatim, and undecodable
-        bytes are replaced rather than raising - a single legacy-encoded file must
-        not disable a gate.
+    def _git_text(self, repository: "Repo", *args: str) -> str:
+        """Run a read-only git command, returning "" on failure.
+
+        Read as bytes and decoded with ``errors="replace"``: a single legacy-encoded
+        file must not disable a whole gate.
         """
-        result = subprocess.run(  # noqa: S603
-            ["git", "-C", str(repo_path), "-c", "core.quotePath=false", *git_args],  # noqa: S607
-            check=False,
-            capture_output=True,
-            text=True,
-            errors="replace",
-        )
-        return result.returncode, result.stdout
+        try:
+            out = repository.git(c="core.quotePath=false").execute(
+                ["git", *args],
+                stdout_as_string=False,
+                with_extended_output=False,
+            )
+        except GitCommandError:
+            return ""
+        return out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
 
-    def _git_output(self, repo_path: Path, *git_args: str) -> str:
-        """Return git's stdout, or an empty string when the command failed."""
-        code, out = self._git(repo_path, *git_args)
-        return out if code == 0 else ""
-
-    def _changed_files(self, repo_path: Path) -> list[str]:
-        """Files the run changed, relative to the pre-run HEAD.
-
-        NUL-delimited: a path may contain spaces or newlines.
-        """
+    def _changed_files(self, repository: "Repo") -> list[str]:
+        """Files the run changed, relative to the pre-run HEAD (NUL-delimited)."""
         if not self._base_sha:
             return []
-        out = self._git_output(repo_path, "diff", "-z", "--name-only", self._base_sha, "HEAD")
+        out = self._git_text(repository, "diff", "-z", "--name-only", self._base_sha, "HEAD")
         return [path for path in out.split("\0") if path]
 
-    def _rev_exists(self, worktree: Path, sha: str) -> bool:
-        code, _ = self._git(worktree, "cat-file", "-e", f"{sha}^{{commit}}")
-        return code == 0
+    def _target_worktrees(self, target_ver: str) -> dict[str, "Repo"]:
+        """The provisioned Odoo checkouts for ``target_ver``, keyed by repository.
 
-    def _gate_source_shas(self, repo_path: Path, target_ver: str) -> list[str]:
+        Uses ``GitConnector.worktrees()`` rather than assuming a directory layout:
+        a version directory holds one checkout per repository, not a repository.
+        """
+        found: dict[str, Repo] = {}
+        for repo, repositories in (
+            ("odoo", ODOO_COMMUNITY_REPOSITORIES),
+            ("enterprise", ODOO_ENTERPRISE_REPOSITORIES),
+        ):
+            connector = GitConnector(repositories[0])
+            for worktree in connector.worktrees():
+                if worktree.name == target_ver:
+                    found[repo] = worktree.repository
+                    break
+        return found
+
+    def _gate_source_shas(self, repository: "Repo", target_ver: str) -> list[str]:
         """Every ``Source:`` SHA must resolve in a provisioned worktree.
 
         A citation that cannot be resolved moves the verification cost to the
         reviewer without saying so.
         """
-        if not self._base_sha:
-            return []
-
-        worktrees = {repo: worktree_for(self.odev.worktrees_path, target_ver, repo) for repo in ("odoo", "enterprise")}
-        missing = sorted(repo for repo, path in worktrees.items() if not is_git_repo(path))
-
+        worktrees = self._target_worktrees(target_ver)
         # NUL-delimited records: a commit body can contain any other byte.
-        log = self._git_output(repo_path, "log", "-z", f"{self._base_sha}..HEAD", "--format=%H%x1f%B")
+        log = self._git_text(repository, "log", "-z", f"{self._base_sha}..HEAD", "--format=%H%x1f%B")
 
         findings: list[str] = []
-        unverifiable = 0
+        unchecked: set[str] = set()
         for entry in filter(None, (e.strip() for e in log.split("\0"))):
             sha, _, body = entry.partition("\x1f")
             for repo, cited in iter_cited_shas(body):
-                if repo in missing:
-                    unverifiable += 1
-                elif not self._rev_exists(worktrees[repo], cited):
-                    # `cat-file -e` also fails an ambiguous abbreviation, so no
-                    # separate length rule is needed - and none is applied, since
-                    # legitimate citations are often abbreviated.
+                target = worktrees.get(repo)
+                if target is None:
+                    unchecked.add(repo)
+                elif not self._commit_exists(target, cited):
+                    # An ambiguous abbreviation also fails to resolve, so no
+                    # separate length rule is applied: valid citations are
+                    # frequently abbreviated.
                     findings.append(f"{sha[:8]} cites {cited} ({repo}): does not resolve")
 
-        if unverifiable:
+        if unchecked:
             # Never report a silent pass: say the gate could not run.
-            findings.append(f"{unverifiable} citation(s) not checked: no {'/'.join(missing)} worktree for {target_ver}")
+            findings.append(
+                f"citations not checked: no {'/'.join(sorted(unchecked))} worktree for {target_ver}",
+            )
         return findings
 
-    def _gate_dead_tokens(self, repo_path: Path, target_ver: str) -> list[str]:
+    @staticmethod
+    def _commit_exists(repository: "Repo", sha: str) -> bool:
+        try:
+            repository.commit(sha)
+        except (ValueError, BadName, GitCommandError):
+            return False
+        return True
+
+    def _gate_dead_tokens(self, repository: "Repo", target_ver: str) -> list[str]:
         """Flag tokens removed upstream that survived in files this run touched.
 
         Scoped to the run's own diff: a token in a file nobody opened is
         pre-existing debt, not a finding against this upgrade.
         """
         tokens = dead_tokens_for(target_ver)
-        changed = self._changed_files(repo_path)
+        changed = self._changed_files(repository)
         if not tokens or not changed:
             return []
 
@@ -684,22 +706,22 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 continue
             # ':(literal)' stops a path such as `foo[1].xml` being read as a glob.
             pathspecs = [f":(literal){path}" for path in paths]
-            out = self._git_output(repo_path, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs)
+            out = self._git_text(repository, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs)
             findings.extend(
                 f"{hit.removeprefix('HEAD:')}: {token!r} survives ({hint})" for hit in out.split("\0") if hit
             )
         return findings
 
-    def _gate_gutted_overrides(self, repo_path: Path, target_ver: str) -> list[str]:
+    def _gate_gutted_overrides(self, repository: "Repo", target_ver: str) -> list[str]:
         """Flag overrides reduced to a bare ``super()`` call.
 
         Deleting an obsolete override is correct; leaving a stub that keeps the
         signature while dropping the body silently removes behaviour.
         """
         findings: list[str] = []
-        for path in (p for p in self._changed_files(repo_path) if p.endswith(".py")):
-            before = self._git_output(repo_path, "show", f"{self._base_sha}:{path}")
-            after = self._git_output(repo_path, "show", f"HEAD:{path}")
+        for path in (p for p in self._changed_files(repository) if p.endswith(".py")):
+            before = self._git_text(repository, "show", f"{self._base_sha}:{path}")
+            after = self._git_text(repository, "show", f"HEAD:{path}")
             if not before or not after:  # added or deleted by the run
                 continue
             findings.extend(f"{path}::{finding}" for finding in gutted_overrides(before, after))
@@ -745,7 +767,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
     def _post_flight_gates(self, repo_path: Path, target_ver: str) -> None:
         """Verify the run's own output. Source-only: no database is required."""
-        if not self._base_sha:
+        repository = self._repository(repo_path)
+        if repository is None or not self._base_sha:
             logger.warning(
                 f"Post-flight gates skipped: could not resolve the pre-run HEAD of {repo_path}. "
                 "Citations, dead tokens and gutted overrides were NOT checked."
@@ -756,7 +779,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         with progress.spinner("Running post-flight gates"):
             for gate in (self._gate_source_shas, self._gate_dead_tokens, self._gate_gutted_overrides):
                 try:
-                    findings.extend(gate(repo_path, target_ver))
+                    findings.extend(gate(repository, target_ver))
                 except Exception as e:  # noqa: BLE001 - a broken gate must not abort the run
                     logger.warning(f"Gate {gate.__name__} did not complete, its findings are missing: {e}")
 
