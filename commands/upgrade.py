@@ -17,6 +17,12 @@ from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
+from odev.plugins.odev_plugin_ai_upgrade.common.gates import (
+    MIN_SHA_LENGTH,
+    dead_tokens_for,
+    gutted_overrides,
+    iter_cited_shas,
+)
 
 
 if TYPE_CHECKING:
@@ -24,6 +30,20 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# Customisation that lives only in the customer database. The run has no access to
+# it (no customer database is provisioned), so it is never migrated and must be
+# declared as unverified rather than silently skipped.
+UNREACHABLE_CUSTOMISATION: tuple[str, ...] = (
+    "Studio views (`ir_ui_view.arch_db`, `studio_customization` records)",
+    "website views customised on write (cowed)",
+    "Studio-authored automations and server actions",
+    "`mail.template` records edited in the database",
+    "saved filters (`ir_filters`)",
+)
+
+COVERAGE_BEGIN = "<!-- BEGIN odev-upgrade:coverage (generated) -->"
+COVERAGE_END = "<!-- END odev-upgrade:coverage -->"
 
 
 class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
@@ -35,6 +55,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
     _name = "upgrade"
     _database_arg_required = False
     _target_db: str | None = None
+    _base_sha: str | None = None
 
     path = args.Path(
         aliases=["--path"],
@@ -80,6 +101,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
     no_ruff = args.Flag(
         aliases=["--no-ruff"],
         description="Don't instruct the AI to run ruff check --fix after edits.",
+        default=False,
+    )
+
+    strict_gates = args.Flag(
+        aliases=["--strict-gates"],
+        description="Fail the run when a post-flight gate reports a finding, instead of warning.",
         default=False,
     )
 
@@ -509,6 +536,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             _modules_info,
         ) = prepared
         self._target_db = target_db
+        self._base_sha = self._git_output(repo_path, "rev-parse", "HEAD").strip() or None
         agent = self.get_ai_agent()
 
         self._cleanup_wizard(stage="pre-flight", exclude=[target_db])
@@ -534,6 +562,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         ):
             return
 
+        self._post_flight_gates(repo_path, target_ver)
         self._sync_knowledge(ki, from_ver, target_ver)
 
     def _get_upgrade_databases(self) -> list[str]:
@@ -566,6 +595,149 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             if db.exists:
                 logger.info(f"Dropping database {db_name!r}...")
                 db.drop()
+
+    def _git_output(self, repo_path: Path, *git_args: str) -> str:
+        result = subprocess.run(  # noqa: S603
+            ["git", "-C", str(repo_path), *git_args],  # noqa: S607
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        return result.stdout
+
+    def _changed_files(self, repo_path: Path) -> list[str]:
+        """Files the run changed, relative to the pre-run HEAD."""
+        if not self._base_sha:
+            return []
+        return self._git_output(repo_path, "diff", "--name-only", self._base_sha, "HEAD").split()
+
+    def _rev_exists(self, worktree: Path, sha: str) -> bool:
+        return (
+            subprocess.run(  # noqa: S603
+                ["git", "-C", str(worktree), "cat-file", "-e", f"{sha}^{{commit}}"],  # noqa: S607
+                check=False,
+                capture_output=True,
+            ).returncode
+            == 0
+        )
+
+    def _gate_source_shas(self, repo_path: Path, target_ver: str) -> list[str]:
+        """Every ``Source:`` SHA must resolve in a provisioned worktree.
+
+        A citation that cannot be resolved moves the verification cost to the
+        reviewer without saying so.
+        """
+        if not self._base_sha:
+            return []
+
+        worktrees = {
+            "odoo": self.odev.worktrees_path / target_ver,
+            "enterprise": self.odev.worktrees_path / target_ver / "enterprise",
+        }
+        log = self._git_output(repo_path, "log", f"{self._base_sha}..HEAD", "--format=%H%x1f%B%x1e")
+
+        findings: list[str] = []
+        for entry in filter(None, (e.strip() for e in log.split("\x1e"))):
+            sha, _, body = entry.partition("\x1f")
+            for repo, cited in iter_cited_shas(body):
+                worktree = worktrees.get(repo)
+                if worktree is None or not worktree.exists():
+                    continue
+                if len(cited) < MIN_SHA_LENGTH:
+                    findings.append(f"{sha[:8]} cites {cited} ({repo}): too short to be unambiguous")
+                elif not self._rev_exists(worktree, cited):
+                    findings.append(f"{sha[:8]} cites {cited} ({repo}): no such commit")
+        return findings
+
+    def _gate_dead_tokens(self, repo_path: Path, target_ver: str) -> list[str]:
+        """Flag tokens removed upstream that survived in files this run touched.
+
+        Scoped to the run's own diff: a token in a file nobody opened is
+        pre-existing debt, not a finding against this upgrade.
+        """
+        tokens = dead_tokens_for(target_ver)
+        changed = self._changed_files(repo_path)
+        if not tokens or not changed:
+            return []
+
+        findings: list[str] = []
+        for token, (_gone_at, hint) in tokens.items():
+            hits = self._git_output(repo_path, "grep", "-lF", "-e", token, "--", *changed).split()
+            findings.extend(f"{path}: {token!r} survives ({hint})" for path in hits)
+        return findings
+
+    def _gate_gutted_overrides(self, repo_path: Path, target_ver: str) -> list[str]:
+        """Flag overrides reduced to a bare ``super()`` call.
+
+        Deleting an obsolete override is correct; leaving a stub that keeps the
+        signature while dropping the body silently removes behaviour.
+        """
+        findings: list[str] = []
+        for path in (p for p in self._changed_files(repo_path) if p.endswith(".py")):
+            before = self._git_output(repo_path, "show", f"{self._base_sha}:{path}")
+            after = self._git_output(repo_path, "show", f"HEAD:{path}")
+            findings.extend(f"{path}::{finding}" for finding in gutted_overrides(before, after))
+        return findings
+
+    def _write_coverage_report(self, repo_path: Path, findings: list[str]) -> None:
+        """Record what this run could not verify in ``UPGRADE.md``.
+
+        Written by the command, not the agent: the command knows what the run had
+        access to, so the section cannot drift from what actually happened.
+        """
+        rows = [
+            f"| {area} | not inspected: no customer database is provisioned to this run |"
+            for area in UNREACHABLE_CUSTOMISATION
+        ]
+        rows.extend(f"| gate finding | {finding} |" for finding in findings)
+
+        section = "\n".join(
+            [
+                COVERAGE_BEGIN,
+                "## Not verified by this run",
+                "",
+                "| area | detail |",
+                "| :--- | :--- |",
+                *rows,
+                COVERAGE_END,
+            ]
+        )
+
+        report = repo_path / "UPGRADE.md"
+        existing = report.read_text(encoding="utf-8") if report.exists() else ""
+        if COVERAGE_BEGIN in existing and COVERAGE_END in existing:
+            head, _, rest = existing.partition(COVERAGE_BEGIN)
+            _, _, tail = rest.partition(COVERAGE_END)
+            updated = f"{head}{section}{tail}"
+        else:
+            updated = f"{existing.rstrip()}\n\n{section}\n" if existing else f"{section}\n"
+        report.write_text(updated, encoding="utf-8")
+        logger.info(f"Coverage section written to {report}")
+
+    def _post_flight_gates(self, repo_path: Path, target_ver: str) -> None:
+        """Verify the run's own output. Source-only: no database is required."""
+        findings: list[str] = []
+        with progress.spinner("Running post-flight gates"):
+            for gate in (self._gate_source_shas, self._gate_dead_tokens, self._gate_gutted_overrides):
+                try:
+                    findings.extend(gate(repo_path, target_ver))
+                except Exception as e:  # noqa: BLE001 - a broken gate must not abort the run
+                    logger.debug(f"Gate {gate.__name__} failed: {e}")
+
+        try:
+            self._write_coverage_report(repo_path, findings)
+        except OSError as e:
+            logger.debug(f"Could not write the coverage section: {e}")
+
+        if not findings:
+            logger.info("Post-flight gates passed.")
+            return
+
+        listing = "\n".join(f"  - {finding}" for finding in findings)
+        message = f"{len(findings)} post-flight gate finding(s):\n{listing}"
+        if self.args.strict_gates:
+            raise self.error(message)
+        logger.warning(message)
 
     def _check_ruff_cleanliness(self, repo_path: Path):
         """Check if the module has many linting errors before starting."""
