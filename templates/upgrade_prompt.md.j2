@@ -9,7 +9,7 @@ Upgrade modules from {{ from_ver }} to {{ target_ver }}.
 
 ### Reasoning Protocol:
 - **Telegraphic Thinking**: Keep internal reasoning brief and focused on the immediate next step.
-- **Efficiency**: Skip over-explaining standard Odoo patterns. Reason only about the immediate action.
+- **Efficiency**: Skip over-*explaining* standard Odoo patterns — never skip *verifying* one. Brevity applies to narration, not to checking: read the target signature before editing an override, resolve a SHA before citing it, confirm a field exists in `{{ target_odoo_path }}` before referencing it.
 - **Delegation**: For massive refactorings (XML, regex, search/replace across multiple files), you MUST delegate the task to a sub-agent using the `invoke_agent` tool to keep session history clean and save tokens.
 
 ### Modules to Upgrade (Topological Order):
@@ -19,8 +19,24 @@ Upgrade modules from {{ from_ver }} to {{ target_ver }}.
 
 **Rule**: Track progress in `TASKS.md`. Initialize it with this module list if missing.
 
+### Outside your reach (do NOT claim these are done):
+You are working from module **source only** — no customer database is provisioned to this run. The following customisation lives in the database and you can neither see nor migrate it:
+- Studio views (`ir_ui_view.arch_db`, `studio_customization` records), including ones the upgrade deactivates
+- website views customised on write (cowed)
+- Studio-authored automations and server actions
+- `mail.template` records edited in the database
+- saved filters (`ir_filters`)
+
+These are the most common source of post-upgrade regressions, and they are invisible from here. So: never describe the upgrade as complete or verified. In `UPGRADE.md`, list them under "Not verified by this run" and name the models and reports you touched that most likely carry such customisation, so a human can check them against the real database.
+
 ### WORKFLOW:
 Refer to the `odoo_upgrade_skill` for the strict step-by-step upgrade workflow and follow it for EACH module.
+
+### Verification rules (they fail silently — install and tests stay green):
+- **Resolve every `Source:` SHA** you cite: `git -C {{ target_odoo_path }} cat-file -e <sha>^{commit}`. If you cannot find the originating commit, write `Source: not identified` and name the core file/symbol you compared against instead. Never write a SHA you have not resolved — an unverifiable citation is worse than none, and a post-flight gate rejects it.
+- **Override boundaries**: match the target's signature exactly (`grep -rn "def <method>" {{ target_odoo_path }}/addons/<app>/models/ -A3`) — never add, drop or rename a parameter you have not seen upstream. **Never reduce an override to a bare `super()` call**: if the customisation is genuinely obsolete, delete the method entirely and cite the commit that made it redundant. A stub that keeps the signature while dropping the body reads as intentional and silently removes a customer feature.
+- **Compute methods**: every dependency path must resolve on the model, and a stored compute must declare dependencies. In a compute loop assign to the loop variable, never to `self`.
+- **No unverified claims**: write "verified" / "tested" / "confirmed" only for a check you actually ran, and name it. A manifest bump is a manifest bump.
 
 ---
 
