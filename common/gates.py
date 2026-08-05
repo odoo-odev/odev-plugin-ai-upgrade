@@ -1,7 +1,9 @@
-"""Citation parsing, version comparison and AST inspection used by the post-flight gates."""
+"""Citation parsing, dead-token lookup and AST inspection used by the post-flight gates."""
 
 import ast
 import re
+
+from odev.common.version import OdooVersion
 
 
 # Tokens removed upstream: any survivor at or after ``gone_at`` is a defect.
@@ -36,25 +38,20 @@ def iter_cited_shas(commit_body: str) -> list[tuple[str, str]]:
     return found
 
 
-def version_key(version: str) -> tuple[int, int]:
-    """Return a sortable ``(major, minor)`` for an Odoo version string.
-
-    Handles ``17.0``, ``saas~18.1`` and bare ``19``. Values carrying no number
-    (``master``) sort above every release, so every known dead token applies.
-    """
-    numbers = re.findall(r"\d+", version or "")
-    if not numbers:
-        return (10**6, 0)
-    return (int(numbers[0]), int(numbers[1]) if len(numbers) > 1 else 0)
-
-
 def dead_tokens_for(target_ver: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
-    """Return the tokens that must no longer appear when migrating to ``target_ver``."""
-    target = version_key(target_ver)
-    return {token: meta for token, meta in DEAD_TOKENS.items() if target >= version_key(meta[0])}
+    """Return the tokens that must no longer appear when migrating to ``target_ver``.
+
+    ``OdooVersion`` orders ``saas~18.1`` below ``19.0`` and ``master`` above every
+    release, which a plain string comparison does not.
+    """
+    try:
+        target = OdooVersion(target_ver)
+    except (ValueError, TypeError):  # InvalidVersion subclasses ValueError
+        return {}
+    return {token: meta for token, meta in DEAD_TOKENS.items() if target >= OdooVersion(meta[0])}
 
 
-def function_bodies(source: str) -> dict[str, tuple[int, bool]]:
+def _function_bodies(source: str) -> dict[str, tuple[int, bool]]:
     """Map a qualified function name to (statement count, is-a-stub).
 
     Docstrings are ignored so documentation cannot mask an empty body. Nested
@@ -144,7 +141,7 @@ def gutted_overrides(before: str, after: str) -> list[str]:
     Deleting an obsolete override is the correct fix and is not reported, and
     neither is a body that was already a stub. Only not-a-stub -> stub is a finding.
     """
-    old, new = function_bodies(before), function_bodies(after)
+    old, new = _function_bodies(before), _function_bodies(after)
     findings = []
     for name, (length, is_stub) in new.items():
         previous = old.get(name)

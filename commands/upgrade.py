@@ -712,11 +712,13 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             )
         return findings
 
-    def _gate_gutted_overrides(self, repository: "Repo", target_ver: str) -> list[str]:
+    def _gate_gutted_overrides(self, repository: "Repo", _target_ver: str) -> list[str]:
         """Flag overrides reduced to a bare ``super()`` call.
 
         Deleting an obsolete override is correct; leaving a stub that keeps the
-        signature while dropping the body silently removes behaviour.
+        signature while dropping the body silently removes behaviour. The version
+        is unused here - the gates share one signature so they can be dispatched
+        in a loop.
         """
         findings: list[str] = []
         for path in (p for p in self._changed_files(repository) if p.endswith(".py")):
