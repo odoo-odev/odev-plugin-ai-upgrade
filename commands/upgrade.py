@@ -1,5 +1,6 @@
 """Upgrade Odoo modules using AI."""
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -508,9 +509,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not self.console.confirm("Sync findings to knowledge index repo as a PR?", default=True):
             return
 
-        import re as _re
-
-        branch_safe = _re.sub(r"[^a-zA-Z0-9._-]", "-", f"odev/upgrade-knowledge-{from_ver}-{target_ver}")
+        branch_safe = re.sub(r"[^a-zA-Z0-9._-]", "-", f"odev/upgrade-knowledge-{from_ver}-{target_ver}")
         pr_url = ki.commit_and_pr(
             branch_name=branch_safe,
             commit_message=f"feat(knowledge): findings for {from_ver}→{target_ver}",
@@ -608,28 +607,61 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         connector = GitConnector(str(repo_path))
         return connector.repository if connector.exists else None
 
-    def _git_text(self, repository: "Repo", *args: str) -> str:
-        """Run a read-only git command, returning "" on failure.
+    def _git_text(self, repository: "Repo", *args: str) -> str | None:
+        """Run a read-only git command, returning ``None`` when git failed.
+
+        ``None`` and ``""`` mean different things: the command failed, versus it
+        succeeded with empty output. Conflating them hides skipped work.
 
         Read as bytes and decoded with ``errors="replace"``: a single legacy-encoded
         file must not disable a whole gate.
         """
         try:
-            out = repository.git(c="core.quotePath=false").execute(
-                ["git", *args],
+            # -c belongs in the argv: Git.__call__ options are only consumed by
+            # _call_process, and it mutates the repository's shared Git object.
+            out = repository.git.execute(
+                ["git", "-c", "core.quotePath=false", *args],
                 stdout_as_string=False,
                 with_extended_output=False,
             )
         except GitCommandError:
-            return ""
+            return None
         return out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
 
-    def _changed_files(self, repository: "Repo") -> list[str]:
-        """Files the run changed, relative to the pre-run HEAD (NUL-delimited)."""
+    def _changed_paths(self, repository: "Repo") -> list[tuple[str, str]]:
+        """``(before_path, after_path)`` for each file the run changed.
+
+        The two differ for a rename, which plain ``--name-only`` reports as the
+        destination alone - the source would then look like a newly added file and
+        be skipped by every gate that compares the two revisions.
+        """
         if not self._base_sha:
             return []
-        out = self._git_text(repository, "diff", "-z", "--name-only", self._base_sha, "HEAD")
-        return [path for path in out.split("\0") if path]
+        out = self._git_text(repository, "diff", "-z", "--name-status", "-M", self._base_sha, "HEAD")
+        if not out:
+            return []
+
+        fields = [field for field in out.split("\0") if field]
+        paths: list[tuple[str, str]] = []
+        index = 0
+        while index < len(fields):
+            status = fields[index]
+            if status.startswith(("R", "C")):  # rename/copy: status, source, destination
+                if index + 2 >= len(fields):
+                    break
+                paths.append((fields[index + 1], fields[index + 2]))
+                index += 3
+            else:
+                if index + 1 >= len(fields):
+                    break
+                path = fields[index + 1]
+                paths.append((path, path))
+                index += 2
+        return paths
+
+    def _changed_files(self, repository: "Repo") -> list[str]:
+        """Paths as they exist after the run."""
+        return [after for _before, after in self._changed_paths(repository)]
 
     def _target_worktrees(self, target_ver: str) -> dict[str, "Repo"]:
         """The provisioned Odoo checkouts for ``target_ver``, keyed by repository.
@@ -657,27 +689,21 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         """
         worktrees = self._target_worktrees(target_ver)
         # NUL-delimited records: a commit body can contain any other byte.
-        log = self._git_text(repository, "log", "-z", f"{self._base_sha}..HEAD", "--format=%H%x1f%B")
+        log = self._git_text(repository, "log", "-z", f"{self._base_sha}..HEAD", "--format=%H%x1f%B") or ""
 
         findings: list[str] = []
-        unchecked: set[str] = set()
         for entry in filter(None, (e.strip() for e in log.split("\0"))):
             sha, _, body = entry.partition("\x1f")
             for repo, cited in iter_cited_shas(body):
                 target = worktrees.get(repo)
                 if target is None:
-                    unchecked.add(repo)
-                elif not self._commit_exists(target, cited):
+                    continue  # reported once by _coverage_notes, not per citation
+                if not self._commit_exists(target, cited):
                     # An ambiguous abbreviation also fails to resolve, so no
                     # separate length rule is applied: valid citations are
                     # frequently abbreviated.
                     findings.append(f"{sha[:8]} cites {cited} ({repo}): does not resolve")
 
-        if unchecked:
-            # Never report a silent pass: say the gate could not run.
-            findings.append(
-                f"citations not checked: no {'/'.join(sorted(unchecked))} worktree for {target_ver}",
-            )
         return findings
 
     @staticmethod
@@ -706,7 +732,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 continue
             # ':(literal)' stops a path such as `foo[1].xml` being read as a glob.
             pathspecs = [f":(literal){path}" for path in paths]
-            out = self._git_text(repository, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs)
+            out = self._git_text(repository, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs) or ""
             findings.extend(
                 f"{hit.removeprefix('HEAD:')}: {token!r} survives ({hint})" for hit in out.split("\0") if hit
             )
@@ -721,25 +747,33 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         in a loop.
         """
         findings: list[str] = []
-        for path in (p for p in self._changed_files(repository) if p.endswith(".py")):
-            before = self._git_text(repository, "show", f"{self._base_sha}:{path}")
-            after = self._git_text(repository, "show", f"HEAD:{path}")
-            if not before or not after:  # added or deleted by the run
+        for before_path, after_path in self._changed_paths(repository):
+            if not after_path.endswith(".py"):
                 continue
-            findings.extend(f"{path}::{finding}" for finding in gutted_overrides(before, after))
+            before = self._git_text(repository, "show", f"{self._base_sha}:{before_path}")
+            after = self._git_text(repository, "show", f"HEAD:{after_path}")
+            if before is None or after is None:  # added or deleted by the run
+                continue
+            findings.extend(f"{after_path}::{finding}" for finding in gutted_overrides(before, after))
         return findings
 
-    def _write_coverage_report(self, repo_path: Path, findings: list[str]) -> None:
+    def _write_coverage_report(self, repo_path: Path, findings: list[str], notes: list[str]) -> None:
         """Record what this run could not verify in ``UPGRADE.md``.
 
         Written by the command, not the agent: the command knows what the run had
         access to, so the section cannot drift from what actually happened.
+
+        Never rewrites unless exactly one well-formed marker pair is present. A
+        stray marker - a crashed run, or the agent copying the one it was shown -
+        would otherwise let the replacement span, and delete, the agent's own
+        hand-off notes.
         """
         rows = [
             f"| {area} | not inspected: no customer database is provisioned to this run |"
             for area in UNREACHABLE_CUSTOMISATION
         ]
-        rows.extend(f"| gate finding | {finding} |" for finding in findings)
+        rows.extend(f"| not checked | {self._escape_cell(note)} |" for note in notes)
+        rows.extend(f"| gate finding | {self._escape_cell(finding)} |" for finding in findings)
 
         section = "\n".join(
             [
@@ -755,17 +789,29 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         report = repo_path / "UPGRADE.md"
         existing = report.read_text(encoding="utf-8", errors="replace") if report.exists() else ""
-        begin, end = existing.find(COVERAGE_BEGIN), existing.find(COVERAGE_END)
-        if begin != -1 and end > begin:
-            updated = f"{existing[:begin]}{section}{existing[end + len(COVERAGE_END) :]}"
-        elif begin != -1 or end != -1:
-            # Malformed or hand-edited markers: appending is safe, rewriting is not.
-            logger.warning(f"Coverage markers in {report} are malformed; appending a new section instead.")
-            updated = f"{existing.rstrip()}\n\n{section}\n"
+
+        # Replace only when the file holds exactly one well-formed pair. A stray
+        # marker would otherwise let the replacement span - and delete - whatever
+        # sits between it and the next END, including the agent's own notes.
+        begins, ends = existing.count(COVERAGE_BEGIN), existing.count(COVERAGE_END)
+        start, stop = existing.find(COVERAGE_BEGIN), existing.find(COVERAGE_END)
+        if begins == 1 and ends == 1 and start < stop:
+            updated = f"{existing[:start]}{section}{existing[stop + len(COVERAGE_END) :]}"
         else:
+            if begins or ends:
+                logger.warning(
+                    f"{report} holds {begins} begin and {ends} end coverage markers; "
+                    "appending a new section rather than risk rewriting over other content."
+                )
             updated = f"{existing.rstrip()}\n\n{section}\n" if existing else f"{section}\n"
+
         report.write_text(updated, encoding="utf-8")
         logger.info(f"Coverage section written to {report} (uncommitted).")
+
+    @staticmethod
+    def _escape_cell(text: str) -> str:
+        """Keep a finding from breaking out of its markdown table cell."""
+        return text.replace("|", "\\|").replace("\n", " ")
 
     def _post_flight_gates(self, repo_path: Path, target_ver: str) -> None:
         """Verify the run's own output. Source-only: no database is required."""
@@ -778,20 +824,27 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             return
 
         findings: list[str] = []
+        notes: list[str] = self._coverage_notes(repository, target_ver)
         with progress.spinner("Running post-flight gates"):
             for gate in (self._gate_source_shas, self._gate_dead_tokens, self._gate_gutted_overrides):
                 try:
                     findings.extend(gate(repository, target_ver))
                 except Exception as e:  # noqa: BLE001 - a broken gate must not abort the run
+                    notes.append(f"gate {gate.__name__} did not complete: {e}")
                     logger.warning(f"Gate {gate.__name__} did not complete, its findings are missing: {e}")
 
         try:
-            self._write_coverage_report(repo_path, findings)
+            self._write_coverage_report(repo_path, findings, notes)
         except OSError as e:
             logger.warning(f"Could not write the coverage section: {e}")
 
+        if notes:
+            # An environment gap is not a defect in the run, so it never trips
+            # --strict-gates - but it must never read as a clean pass either.
+            logger.warning("Not checked by the post-flight gates:\n" + "\n".join(f"  - {note}" for note in notes))
+
         if not findings:
-            logger.info("Post-flight gates passed.")
+            logger.info("Post-flight gates passed." if not notes else "Post-flight gates passed, with gaps (above).")
             return
 
         listing = "\n".join(f"  - {finding}" for finding in findings)
@@ -801,6 +854,22 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             # and an unresolvable citation must not reach the knowledge base.
             raise self.error(f"{message}\nKnowledge sync skipped. Re-run without --strict-gates to sync anyway.")
         logger.warning(message)
+
+    def _coverage_notes(self, repository: "Repo", target_ver: str) -> list[str]:
+        """State what the gates could not look at, so a pass is never mistaken for coverage."""
+        notes: list[str] = []
+
+        if repository.head.is_valid() and repository.head.commit.hexsha == self._base_sha:
+            notes.append("the run produced no commits, so nothing was inspected")
+        if repository.is_dirty(untracked_files=True):
+            notes.append("uncommitted changes are present and were not inspected (gates read committed state only)")
+
+        missing = sorted({"odoo", "enterprise"} - set(self._target_worktrees(target_ver)))
+        if missing:
+            notes.append(f"citations against {', '.join(missing)} could not be checked: no worktree for {target_ver}")
+        if self.args.submodules:
+            notes.append("submodule contents were not inspected: the parent repository records only a gitlink")
+        return notes
 
     def _check_ruff_cleanliness(self, repo_path: Path):
         """Check if the module has many linting errors before starting."""

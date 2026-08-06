@@ -15,11 +15,14 @@ DEAD_TOKENS: dict[str, tuple[str, str, tuple[str, ...]]] = {
 }
 
 # A citation is trusted in one of two shapes: a commit URL/shorthand, or a
-# ``Source:`` trailer. The trailer form additionally requires a digit, because
-# plain hex letters also spell ordinary words ("defaced", "facade").
+# ``Source:`` trailer. Both accept abbreviations, because real citations are
+# frequently abbreviated, and resolution decides the rest: a hex-looking word
+# such as "deadbeef" simply fails to resolve and is reported, which is right -
+# it is a bad citation. Anything narrower would silently stop checking the
+# abbreviated citations that actually appear in practice.
 SOURCE_URL_RE = re.compile(r"(?:github\.com/)?odoo/(?P<repo>odoo|enterprise)[/@]+(?:commit/)?(?P<sha>[0-9a-f]{7,40})\b")
 SOURCE_TRAILER_RE = re.compile(
-    r"Source:\s*(?P<repo>odoo|enterprise)?\s*(?P<sha>(?=[0-9a-f]{7,40}\b)[a-f]*[0-9][0-9a-f]*)\b",
+    r"Source:\s*(?P<repo>odoo|enterprise)?\s*(?P<sha>[0-9a-f]{7,40})\b",
     re.IGNORECASE,
 )
 
@@ -51,19 +54,21 @@ def dead_tokens_for(target_ver: str) -> dict[str, tuple[str, str, tuple[str, ...
     return {token: meta for token, meta in DEAD_TOKENS.items() if target >= OdooVersion(meta[0])}
 
 
-def _function_bodies(source: str) -> dict[str, tuple[int, bool]]:
-    """Map a qualified function name to (statement count, is-a-stub).
+def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
+    """Map a qualified function name to every (statement count, is-a-stub) it has.
 
-    Docstrings are ignored so documentation cannot mask an empty body. Nested
-    functions are qualified by their enclosing function, so they never collide
-    with a method of the same name. Returns ``{}`` when ``source`` does not parse.
+    A name can be defined more than once in one file - ``@property`` plus its
+    setter, ``@overload`` stubs, ``if TYPE_CHECKING`` branches - so the value is a
+    list. Docstrings are ignored so documentation cannot mask an empty body.
+    Nested functions are qualified by their enclosing function. Returns ``None``
+    when the source does not parse, which is itself worth reporting.
     """
     try:
         tree = ast.parse(source)
     except (SyntaxError, ValueError):
-        return {}
+        return None
 
-    bodies: dict[str, tuple[int, bool]] = {}
+    bodies: dict[str, list[tuple[int, bool]]] = {}
     scope: list[str] = []
 
     def visit(node: ast.AST) -> None:
@@ -75,7 +80,8 @@ def _function_bodies(source: str) -> dict[str, tuple[int, bool]]:
                         for statement in child.body
                         if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
                     ]
-                    bodies[".".join([*scope, child.name])] = (len(body), _is_stub_body(body))
+                    name = ".".join([*scope, child.name])
+                    bodies.setdefault(name, []).append((len(body), _is_stub_body(body)))
                 scope.append(child.name)
                 visit(child)
                 scope.pop()
@@ -139,12 +145,23 @@ def gutted_overrides(before: str, after: str) -> list[str]:
     """Return names of methods whose body was replaced by a bare ``super()`` call.
 
     Deleting an obsolete override is the correct fix and is not reported, and
-    neither is a body that was already a stub. Only not-a-stub -> stub is a finding.
+    neither is a body that was already a stub. Only not-a-stub -> stub is a
+    finding. A name defined more than once on either side is skipped rather than
+    guessed at: a ``@property``/setter pair or an ``@overload`` stub would
+    otherwise read as a gutted body.
     """
     old, new = _function_bodies(before), _function_bodies(after)
+    if new is None:
+        return ["file no longer parses as Python"]
+    if old is None:
+        return []
+
     findings = []
-    for name, (length, is_stub) in new.items():
+    for name, definitions in new.items():
         previous = old.get(name)
-        if previous and is_stub and not previous[1]:
-            findings.append(f"{name}: body reduced to a bare super() call ({previous[0]} -> {length})")
+        if not previous or len(definitions) != 1 or len(previous) != 1:
+            continue
+        (length, is_stub), (was_length, was_stub) = definitions[0], previous[0]
+        if is_stub and not was_stub:
+            findings.append(f"{name}: body reduced to a bare super() call ({was_length} -> {length})")
     return findings
