@@ -695,14 +695,18 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         for entry in filter(None, (e.strip() for e in log.split("\0"))):
             sha, _, body = entry.partition("\x1f")
             for repo, cited in iter_cited_shas(body):
-                target = worktrees.get(repo)
-                if target is None:
+                # Most citations name no repository, and the ones that do are not
+                # always right, so accept the commit from any provisioned checkout:
+                # the question is whether it exists in the Odoo source, not where.
+                candidates = [worktrees[repo]] if repo in worktrees else list(worktrees.values())
+                if not candidates:
                     continue  # reported once by _coverage_notes, not per citation
-                if not self._commit_exists(target, cited):
+                if not any(self._commit_exists(target, cited) for target in candidates):
                     # An ambiguous abbreviation also fails to resolve, so no
                     # separate length rule is applied: valid citations are
                     # frequently abbreviated.
-                    findings.append(f"{sha[:8]} cites {cited} ({repo}): does not resolve")
+                    where = repo or "/".join(sorted(worktrees))
+                    findings.append(f"{sha[:8]} cites {cited} ({where}): does not resolve")
 
         return findings
 

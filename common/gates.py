@@ -21,21 +21,30 @@ DEAD_TOKENS: dict[str, tuple[str, str, tuple[str, ...]]] = {
 # it is a bad citation. Anything narrower would silently stop checking the
 # abbreviated citations that actually appear in practice.
 SOURCE_URL_RE = re.compile(r"(?:github\.com/)?odoo/(?P<repo>odoo|enterprise)[/@]+(?:commit/)?(?P<sha>[0-9a-f]{7,40})\b")
+# The repository qualifier appears on either side in practice - `Source: enterprise <sha>`
+# and `Source: <sha> (enterprise)` are both used - and is often absent entirely. Any other
+# parenthetical is a human note ("(qty_done -> quantity)"), not a repository.
 SOURCE_TRAILER_RE = re.compile(
-    r"Source:\s*(?P<repo>odoo|enterprise)?\s*(?P<sha>[0-9a-f]{7,40})\b",
+    r"Source:\s*(?P<repo>odoo|enterprise)?\s*(?P<sha>[0-9a-f]{7,40})\b"
+    r"(?:\s*\((?P<repo_after>odoo|enterprise)\))?",
     re.IGNORECASE,
 )
 
 
-def iter_cited_shas(commit_body: str) -> list[tuple[str, str]]:
+def iter_cited_shas(commit_body: str) -> list[tuple[str | None, str]]:
     """Return ``(repo, sha)`` for every Odoo commit cited in a commit body.
 
-    Deduplicated, order preserved. ``Source: not identified`` yields nothing.
+    ``repo`` is ``None`` when the citation does not name one, which is the common
+    case; the caller should then accept the commit from any provisioned checkout
+    rather than assume community. Deduplicated, order preserved.
+    ``Source: not identified`` yields nothing.
     """
-    found: list[tuple[str, str]] = []
+    found: list[tuple[str | None, str]] = []
     for pattern in (SOURCE_URL_RE, SOURCE_TRAILER_RE):
         for match in pattern.finditer(commit_body):
-            entry = (match.group("repo") or "odoo", match.group("sha"))
+            groups = match.groupdict()
+            repo = groups.get("repo") or groups.get("repo_after")
+            entry = (repo.lower() if repo else None, match.group("sha"))
             if entry not in found:
                 found.append(entry)
     return found
