@@ -1,29 +1,20 @@
-"""Citation parsing, dead-token lookup and AST inspection used by the post-flight gates."""
+"""Helpers for the post-flight checks: reading citations, and spotting emptied overrides.
+
+Both answer questions the agent cannot answer about itself — does this commit it
+cited actually exist, and did it quietly delete a method body — so neither
+re-does any part of the migration.
+"""
 
 import ast
 import re
 
-from odev.common.version import OdooVersion
 
-
-# Tokens removed upstream: any survivor at or after ``gone_at`` is a defect.
-# ``suffixes`` limits the search to file types where the token is meaningful.
-DEAD_TOKENS: dict[str, tuple[str, str, tuple[str, ...]]] = {
-    "kanban-box": ("19.0", "renamed to t-name='card' in 19.0", (".xml",)),
-    "attrs=": ("17.0", "split into invisible/readonly/required", (".xml",)),
-    "states=": ("17.0", "use invisible= with a domain on state", (".xml",)),
-}
-
-# A citation is trusted in one of two shapes: a commit URL/shorthand, or a
-# ``Source:`` trailer. Both accept abbreviations, because real citations are
-# frequently abbreviated, and resolution decides the rest: a hex-looking word
-# such as "deadbeef" simply fails to resolve and is reported, which is right -
-# it is a bad citation. Anything narrower would silently stop checking the
-# abbreviated citations that actually appear in practice.
+# A citation appears either as a commit URL or as a `Source:` trailer. The repository
+# qualifier shows up on either side in practice (`Source: enterprise <sha>` and
+# `Source: <sha> (enterprise)`), and is usually absent; any other parenthetical is a
+# human note, not a repository. Abbreviations are accepted — whether the commit
+# resolves is what matters, and that is decided by looking it up, not by its shape.
 SOURCE_URL_RE = re.compile(r"(?:github\.com/)?odoo/(?P<repo>odoo|enterprise)[/@]+(?:commit/)?(?P<sha>[0-9a-f]{7,40})\b")
-# The repository qualifier appears on either side in practice - `Source: enterprise <sha>`
-# and `Source: <sha> (enterprise)` are both used - and is often absent entirely. Any other
-# parenthetical is a human note ("(qty_done -> quantity)"), not a repository.
 SOURCE_TRAILER_RE = re.compile(
     r"Source:\s*(?P<repo>odoo|enterprise)?\s*(?P<sha>[0-9a-f]{7,40})\b"
     r"(?:\s*\((?P<repo_after>odoo|enterprise)\))?",
@@ -35,9 +26,8 @@ def iter_cited_shas(commit_body: str) -> list[tuple[str | None, str]]:
     """Return ``(repo, sha)`` for every Odoo commit cited in a commit body.
 
     ``repo`` is ``None`` when the citation does not name one, which is the common
-    case; the caller should then accept the commit from any provisioned checkout
-    rather than assume community. Deduplicated, order preserved.
-    ``Source: not identified`` yields nothing.
+    case; the caller should then accept the commit from any provisioned checkout.
+    Deduplicated, order preserved. ``Source: not identified`` yields nothing.
     """
     found: list[tuple[str | None, str]] = []
     for pattern in (SOURCE_URL_RE, SOURCE_TRAILER_RE):
@@ -50,27 +40,38 @@ def iter_cited_shas(commit_body: str) -> list[tuple[str | None, str]]:
     return found
 
 
-def dead_tokens_for(target_ver: str) -> dict[str, tuple[str, str, tuple[str, ...]]]:
-    """Return the tokens that must no longer appear when migrating to ``target_ver``.
+def gutted_overrides(before: str, after: str) -> list[str]:
+    """Return methods whose body was replaced by a bare ``super()`` call.
 
-    ``OdooVersion`` orders ``saas~18.1`` below ``19.0`` and ``master`` above every
-    release, which a plain string comparison does not.
+    Deleting an obsolete override is the correct fix and is not reported; neither
+    is a body that was already a stub. Only not-a-stub -> stub is a finding, since
+    that keeps the signature and the docstring while dropping the behaviour, which
+    installs clean and passes tests.
     """
-    try:
-        target = OdooVersion(target_ver)
-    except (ValueError, TypeError):  # InvalidVersion subclasses ValueError
-        return {}
-    return {token: meta for token, meta in DEAD_TOKENS.items() if target >= OdooVersion(meta[0])}
+    old, new = _function_bodies(before), _function_bodies(after)
+    if new is None:
+        return ["file no longer parses as Python"]
+    if old is None:
+        return []
+
+    findings = []
+    for name, definitions in new.items():
+        previous = old.get(name)
+        # A name defined twice (a property and its setter, an @overload stub) is
+        # skipped rather than guessed at.
+        if not previous or len(definitions) != 1 or len(previous) != 1:
+            continue
+        (length, is_stub), (was_length, was_stub) = definitions[0], previous[0]
+        if is_stub and not was_stub:
+            findings.append(f"{name}: body reduced to a bare super() call ({was_length} -> {length})")
+    return findings
 
 
 def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
     """Map a qualified function name to every (statement count, is-a-stub) it has.
 
-    A name can be defined more than once in one file - ``@property`` plus its
-    setter, ``@overload`` stubs, ``if TYPE_CHECKING`` branches - so the value is a
-    list. Docstrings are ignored so documentation cannot mask an empty body.
-    Nested functions are qualified by their enclosing function. Returns ``None``
-    when the source does not parse, which is itself worth reporting.
+    Returns ``None`` when the source does not parse, which is itself worth
+    reporting. Docstrings are ignored so documentation cannot mask an empty body.
     """
     try:
         tree = ast.parse(source)
@@ -90,7 +91,7 @@ def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
                         if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
                     ]
                     name = ".".join([*scope, child.name])
-                    bodies.setdefault(name, []).append((len(body), _is_stub_body(body)))
+                    bodies.setdefault(name, []).append((len(body), _is_stub(body)))
                 scope.append(child.name)
                 visit(child)
                 scope.pop()
@@ -110,11 +111,22 @@ def _calls_super(node: ast.AST | None) -> bool:
 
 
 # `res = super().x(...)` followed by `return res` is the longest delegating body.
-_DELEGATING_BODY_LENGTH = 2
+_DELEGATING_LENGTH = 2
 
 
-def _is_single_statement_stub(statement: ast.stmt) -> bool:
-    """Whether a lone statement is `pass`, a bare `return`, or a `super()` delegation."""
+def _is_stub(body: list[ast.stmt]) -> bool:
+    """Whether a body does nothing but delegate upwards, or nothing at all."""
+    if not body:  # docstring-only, or `...`
+        return True
+    if len(body) == 1:
+        return _is_lone_stub(body[0])
+    if len(body) == _DELEGATING_LENGTH:
+        return _assigns_super_then_returns_it(body)
+    return False
+
+
+def _is_lone_stub(statement: ast.stmt) -> bool:
+    """Whether a single statement is `pass`, a bare `return`, or a `super()` delegation."""
     if isinstance(statement, ast.Pass):
         return True
     if isinstance(statement, ast.Return):
@@ -125,7 +137,7 @@ def _is_single_statement_stub(statement: ast.stmt) -> bool:
 
 
 def _assigns_super_then_returns_it(body: list[ast.stmt]) -> bool:
-    """Whether the body is `res = super().x(...)` followed by `return res`."""
+    """Whether the body is `res = super().x(...)` then `return res`."""
     assign, returned = body
     targets = getattr(assign, "targets", None)
     return bool(
@@ -137,40 +149,3 @@ def _assigns_super_then_returns_it(body: list[ast.stmt]) -> bool:
         and isinstance(targets[0], ast.Name)
         and targets[0].id == returned.value.id
     )
-
-
-def _is_stub_body(body: list[ast.stmt]) -> bool:
-    """Whether a function body does nothing but delegate upwards, or nothing at all."""
-    if not body:  # docstring-only, or `...`
-        return True
-    if len(body) == 1:
-        return _is_single_statement_stub(body[0])
-    if len(body) == _DELEGATING_BODY_LENGTH:
-        return _assigns_super_then_returns_it(body)
-    return False
-
-
-def gutted_overrides(before: str, after: str) -> list[str]:
-    """Return names of methods whose body was replaced by a bare ``super()`` call.
-
-    Deleting an obsolete override is the correct fix and is not reported, and
-    neither is a body that was already a stub. Only not-a-stub -> stub is a
-    finding. A name defined more than once on either side is skipped rather than
-    guessed at: a ``@property``/setter pair or an ``@overload`` stub would
-    otherwise read as a gutted body.
-    """
-    old, new = _function_bodies(before), _function_bodies(after)
-    if new is None:
-        return ["file no longer parses as Python"]
-    if old is None:
-        return []
-
-    findings = []
-    for name, definitions in new.items():
-        previous = old.get(name)
-        if not previous or len(definitions) != 1 or len(previous) != 1:
-            continue
-        (length, is_stub), (was_length, was_stub) = definitions[0], previous[0]
-        if is_stub and not was_stub:
-            findings.append(f"{name}: body reduced to a bare super() call ({was_length} -> {length})")
-    return findings

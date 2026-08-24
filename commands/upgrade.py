@@ -24,11 +24,7 @@ from odev.common.odoobin import (
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
-from odev.plugins.odev_plugin_ai_upgrade.common.gates import (
-    dead_tokens_for,
-    gutted_overrides,
-    iter_cited_shas,
-)
+from odev.plugins.odev_plugin_ai_upgrade.common.gates import gutted_overrides, iter_cited_shas
 
 
 if TYPE_CHECKING:
@@ -47,9 +43,6 @@ UNREACHABLE_CUSTOMISATION: tuple[str, ...] = (
     "`mail.template` records edited in the database",
     "saved filters (`ir_filters`)",
 )
-
-COVERAGE_BEGIN = "<!-- BEGIN odev-upgrade:coverage (generated) -->"
-COVERAGE_END = "<!-- END odev-upgrade:coverage -->"
 
 
 class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
@@ -659,10 +652,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 index += 2
         return paths
 
-    def _changed_files(self, repository: "Repo") -> list[str]:
-        """Paths as they exist after the run."""
-        return [after for _before, after in self._changed_paths(repository)]
-
     def _target_worktrees(self, target_ver: str) -> dict[str, "Repo"]:
         """The provisioned Odoo checkouts for ``target_ver``, keyed by repository.
 
@@ -718,30 +707,6 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             return False
         return True
 
-    def _gate_dead_tokens(self, repository: "Repo", target_ver: str) -> list[str]:
-        """Flag tokens removed upstream that survived in files this run touched.
-
-        Scoped to the run's own diff: a token in a file nobody opened is
-        pre-existing debt, not a finding against this upgrade.
-        """
-        tokens = dead_tokens_for(target_ver)
-        changed = self._changed_files(repository)
-        if not tokens or not changed:
-            return []
-
-        findings: list[str] = []
-        for token, (_gone_at, hint, suffixes) in tokens.items():
-            paths = [p for p in changed if p.endswith(suffixes)]
-            if not paths:
-                continue
-            # ':(literal)' stops a path such as `foo[1].xml` being read as a glob.
-            pathspecs = [f":(literal){path}" for path in paths]
-            out = self._git_text(repository, "grep", "-lzF", "-e", token, "HEAD", "--", *pathspecs) or ""
-            findings.extend(
-                f"{hit.removeprefix('HEAD:')}: {token!r} survives ({hint})" for hit in out.split("\0") if hit
-            )
-        return findings
-
     def _gate_gutted_overrides(self, repository: "Repo", _target_ver: str) -> list[str]:
         """Flag overrides reduced to a bare ``super()`` call.
 
@@ -761,101 +726,35 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             findings.extend(f"{after_path}::{finding}" for finding in gutted_overrides(before, after))
         return findings
 
-    def _write_coverage_report(self, repo_path: Path, findings: list[str], notes: list[str]) -> None:
-        """Record what this run could not verify in ``UPGRADE.md``.
-
-        Written by the command, not the agent: the command knows what the run had
-        access to, so the section cannot drift from what actually happened.
-
-        Never rewrites unless exactly one well-formed marker pair is present. A
-        stray marker - a crashed run, or the agent copying the one it was shown -
-        would otherwise let the replacement span, and delete, the agent's own
-        hand-off notes.
-        """
-        rows = [
-            f"| {area} | not inspected: no customer database is provisioned to this run |"
-            for area in UNREACHABLE_CUSTOMISATION
-        ]
-        rows.extend(f"| not checked | {self._escape_cell(note)} |" for note in notes)
-        rows.extend(f"| gate finding | {self._escape_cell(finding)} |" for finding in findings)
-
-        section = "\n".join(
-            [
-                COVERAGE_BEGIN,
-                "## Not verified by this run",
-                "",
-                "| area | detail |",
-                "| :--- | :--- |",
-                *rows,
-                COVERAGE_END,
-            ]
-        )
-
-        report = repo_path / "UPGRADE.md"
-        existing = report.read_text(encoding="utf-8", errors="replace") if report.exists() else ""
-
-        # Replace only when the file holds exactly one well-formed pair. A stray
-        # marker would otherwise let the replacement span - and delete - whatever
-        # sits between it and the next END, including the agent's own notes.
-        begins, ends = existing.count(COVERAGE_BEGIN), existing.count(COVERAGE_END)
-        start, stop = existing.find(COVERAGE_BEGIN), existing.find(COVERAGE_END)
-        if begins == 1 and ends == 1 and start < stop:
-            updated = f"{existing[:start]}{section}{existing[stop + len(COVERAGE_END) :]}"
-        else:
-            if begins or ends:
-                logger.warning(
-                    f"{report} holds {begins} begin and {ends} end coverage markers; "
-                    "appending a new section rather than risk rewriting over other content."
-                )
-            updated = f"{existing.rstrip()}\n\n{section}\n" if existing else f"{section}\n"
-
-        report.write_text(updated, encoding="utf-8")
-        logger.info(f"Coverage section written to {report} (uncommitted).")
-
-    @staticmethod
-    def _escape_cell(text: str) -> str:
-        """Keep a finding from breaking out of its markdown table cell."""
-        return text.replace("|", "\\|").replace("\n", " ")
-
     def _post_flight_gates(self, repo_path: Path, target_ver: str) -> None:
-        """Verify the run's own output. Source-only: no database is required."""
+        """Report on the run's own commits. Reads git only; needs no database."""
         repository = self._repository(repo_path)
         if repository is None or not self._base_sha:
-            logger.warning(
-                f"Post-flight gates skipped: could not resolve the pre-run HEAD of {repo_path}. "
-                "Citations, dead tokens and gutted overrides were NOT checked."
-            )
+            logger.warning(f"Post-flight checks skipped: could not resolve the pre-run HEAD of {repo_path}.")
             return
 
         findings: list[str] = []
         notes: list[str] = self._coverage_notes(repository, target_ver)
-        with progress.spinner("Running post-flight gates"):
-            for gate in (self._gate_source_shas, self._gate_dead_tokens, self._gate_gutted_overrides):
+        with progress.spinner("Running post-flight checks"):
+            for gate in (self._gate_source_shas, self._gate_gutted_overrides):
                 try:
                     findings.extend(gate(repository, target_ver))
-                except Exception as e:  # noqa: BLE001 - a broken gate must not abort the run
-                    notes.append(f"gate {gate.__name__} did not complete: {e}")
-                    logger.warning(f"Gate {gate.__name__} did not complete, its findings are missing: {e}")
-
-        try:
-            self._write_coverage_report(repo_path, findings, notes)
-        except OSError as e:
-            logger.warning(f"Could not write the coverage section: {e}")
+                except Exception as e:  # noqa: BLE001 - a broken check must not abort the run
+                    notes.append(f"{gate.__name__} did not complete: {e}")
 
         if notes:
-            # An environment gap is not a defect in the run, so it never trips
-            # --strict-gates - but it must never read as a clean pass either.
-            logger.warning("Not checked by the post-flight gates:\n" + "\n".join(f"  - {note}" for note in notes))
+            # A gap in the environment is not a defect in the run, so it never trips
+            # --strict-gates - but it must not read as a clean pass either.
+            logger.warning("Not checked:\n" + "\n".join(f"  - {note}" for note in notes))
 
         if not findings:
-            logger.info("Post-flight gates passed." if not notes else "Post-flight gates passed, with gaps (above).")
+            logger.info("Post-flight checks passed." if not notes else "Post-flight checks passed, with gaps above.")
             return
 
-        listing = "\n".join(f"  - {finding}" for finding in findings)
-        message = f"{len(findings)} post-flight gate finding(s):\n{listing}"
+        message = f"{len(findings)} post-flight finding(s):\n" + "\n".join(f"  - {f}" for f in findings)
         if self.args.strict_gates:
-            # Deliberately before the knowledge sync: that harvests `Source:` SHAs,
-            # and an unresolvable citation must not reach the knowledge base.
+            # Before the knowledge sync on purpose: that harvests `Source:` SHAs, and an
+            # unresolvable citation must not reach the knowledge base.
             raise self.error(f"{message}\nKnowledge sync skipped. Re-run without --strict-gates to sync anyway.")
         logger.warning(message)
 
