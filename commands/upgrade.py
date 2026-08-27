@@ -515,14 +515,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         logger.info(f"Starting Project-wide AI Upgrade: from {from_ver} to {target_ver} ({target_db})")
 
-        # Check for missing upgrade skills via npx skills list -g
-        loaded_skills = self._get_loaded_skills()
-        missing = [s for s in ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"] if s not in loaded_skills]
-        if missing:
-            logger.warning(
-                f"Missing upgrade skills: {', '.join(missing)}. "
-                "To load them, run: npx skills add odoo-ps/ps-ai-skills --skills odoo_upgrade_utils,custom_util,odoo_upgrade_skill"
-            )
+        self._ensure_skills(agent, ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"])
 
         if not agent.run(
             prompt,
