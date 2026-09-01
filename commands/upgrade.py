@@ -1,7 +1,5 @@
 """Upgrade Odoo modules using AI."""
 
-import ast
-import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -9,22 +7,13 @@ from typing import TYPE_CHECKING
 
 import jinja2
 import networkx as nx
-from git import Repo
 
 from odev.common import args, progress
 from odev.common.commands import DatabaseCommand
 from odev.common.connectors import GitConnector
-from odev.common.console import console
-from odev.common.databases import LocalDatabase
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
-from odev.common.odoobin import (
-    ODOO_COMMUNITY_REPOSITORIES,
-    ODOO_ENTERPRISE_REPOSITORIES,
-    ODOO_UPGRADE_REPOSITORY,
-    OdoobinProcess,
-)
-from odev.common.store.datastore import DataStore
+from odev.common.odoobin import ODOO_UPGRADE_REPOSITORY, OdoobinProcess
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
@@ -35,9 +24,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-# Above this many lines in `ruff check --diff`, auto-linting would drown the git diff.
-NOISY_RUFF_DIFF_LINES = 50
 
 
 class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
@@ -153,6 +139,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         from_ver: str,
     ) -> dict[str, str]:
         """Return the transitive standard Odoo dependencies of the given custom modules."""
+        from odev.common.odoobin import ODOO_COMMUNITY_REPOSITORIES, ODOO_ENTERPRISE_REPOSITORIES
+
         custom_names: set[str] = {m["name"] for m in modules_info}
         community_connector = GitConnector(ODOO_COMMUNITY_REPOSITORIES[0])
         enterprise_connector = GitConnector(ODOO_ENTERPRISE_REPOSITORIES[0])
@@ -208,6 +196,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     if manifest:
                         return manifest, kind
 
+        import ast
+
         for kind, connector in connectors_map.items():
             for sub in ["", "addons"]:
                 path = f"{sub}/{name}/__manifest__.py" if sub else f"{name}/__manifest__.py"
@@ -216,8 +206,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     manifest = ast.literal_eval(content)
                     if isinstance(manifest, dict):
                         return manifest, kind
-                except Exception as e:  # noqa: BLE001 - any unreadable manifest just means "try the next path"
-                    logger.debug(f"Could not read {path!r} at {version}: {e}")
+                except Exception:
                     continue
         return None
 
@@ -288,12 +277,14 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         if self.args.submodules:
             try:
+                from git import Repo
+
                 repo = Repo(self.args.path, search_parent_directories=True)
                 for submodule in repo.submodules:
                     sm_path = Path(repo.working_dir) / submodule.path
                     if sm_path not in search_paths:
                         search_paths.append(sm_path)
-            except Exception as e:  # noqa: BLE001 - submodules are optional, never fail the run over them
+            except Exception as e:
                 logger.warning(f"Could not find submodules in {self.args.path}: {e}")
 
         modules_info = self._get_sorted_modules(search_paths)
@@ -383,9 +374,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         upgrade_path: Path,
     ) -> tuple["KnowledgeIndex | None", str | None]:
         """Setup KnowledgeIndex."""
-        from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import (  # noqa: PLC0415 - avoid a circular import
-            KnowledgeIndex,
-        )
+        from odev.common.store.datastore import DataStore
+
+        from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import KnowledgeIndex
 
         try:
             ki = KnowledgeIndex(self.config, DataStore())
@@ -402,12 +393,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                 logger.warning(f"Knowledge index: no standard Odoo dependencies found for {from_ver}.")
 
             local_path = ki.local_path.resolve().as_posix()
-        except Exception as e:  # noqa: BLE001 - the index is a nice-to-have, never fail the upgrade over it
+            return ki, local_path
+        except Exception as e:
             logger.warning(f"Knowledge index unavailable: {e}. Proceeding without it.")
             return None, None
-        return ki, local_path
 
-    def _build_final_prompt(  # noqa: PLR0913 - the prompt template needs every one of these
+    def _build_final_prompt(
         self,
         from_ver: str,
         target_ver: str,
@@ -461,6 +452,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if xgram := EmployeeUtils(self.odev).get_xgram():
             branch_name += f"-{xgram}"
 
+        from odev.common.console import console
+
         if console.confirm(
             f"Repository at {repo_path} is on a protected branch ({connector.branch!r}).\n"
             f"Do you want to create and switch to a new feature branch '{branch_name}'?",
@@ -470,7 +463,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             try:
                 connector.repository.git.checkout("-b", branch_name)
             except Exception as e:
-                raise self.error(f"Failed to create branch {branch_name!r}: {e}") from e
+                raise self.error(f"Failed to create branch {branch_name!r}: {e}")
         else:
             raise self.error(f"Protected branch {connector.branch!r} detected. Feature branch required.")
 
@@ -482,7 +475,9 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not self.console.confirm("Sync findings to knowledge index repo as a PR?", default=True):
             return
 
-        branch_safe = re.sub(r"[^a-zA-Z0-9._-]", "-", f"odev/upgrade-knowledge-{from_ver}-{target_ver}")
+        import re as _re
+
+        branch_safe = _re.sub(r"[^a-zA-Z0-9._-]", "-", f"odev/upgrade-knowledge-{from_ver}-{target_ver}")
         pr_url = ki.commit_and_pr(
             branch_name=branch_safe,
             commit_message=f"feat(knowledge): findings for {from_ver}→{target_ver}",
@@ -520,10 +515,14 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         logger.info(f"Starting Project-wide AI Upgrade: from {from_ver} to {target_ver} ({target_db})")
 
-        self._ensure_skills(
-            ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"],
-            handler=agent.handler,
-        )
+        # Check for missing upgrade skills via npx skills list -g
+        loaded_skills = self._get_loaded_skills()
+        missing = [s for s in ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"] if s not in loaded_skills]
+        if missing:
+            logger.warning(
+                f"Missing upgrade skills: {', '.join(missing)}. "
+                "To load them, run: npx skills add odoo-ps/ps-ai-skills --skills odoo_upgrade_utils,custom_util,odoo_upgrade_skill"
+            )
 
         if not agent.run(
             prompt,
@@ -560,6 +559,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         if not to_delete:
             return
 
+        from odev.common.databases import LocalDatabase
+
         for db_name in to_delete:
             db = LocalDatabase(db_name)
             if db.exists:
@@ -568,20 +569,19 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
     def _check_ruff_cleanliness(self, repo_path: Path):
         """Check if the module has many linting errors before starting."""
-        ruff = shutil.which("ruff")
-        if not ruff:
+        if not shutil.which("ruff"):
             return
 
         with progress.spinner("Checking module linting cleanliness"):
             try:
-                diff_process = subprocess.run(  # noqa: S603 - the arguments are built here, never user input
-                    [ruff, "check", str(repo_path), "--diff", "--exit-zero"],
+                diff_process = subprocess.run(
+                    ["ruff", "check", str(repo_path), "--diff", "--exit-zero"],
                     check=False,
                     capture_output=True,
                     text=True,
                 )
                 diff_lines = diff_process.stdout.count("\n")
-                if diff_lines > NOISY_RUFF_DIFF_LINES:
+                if diff_lines > 50:
                     logger.warning(
                         f"\nWARNING: Module at {repo_path} has many linting issues "
                         f"({diff_lines} lines affected by ruff).\n"
@@ -594,5 +594,5 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
                     ):
                         self.args.no_ruff = True
                         logger.info("Automatic ruff instructions disabled.")
-            except Exception as e:  # noqa: BLE001 - a failed lint probe must never block the upgrade
+            except Exception as e:
                 logger.debug(f"Ruff cleanliness check failed: {e}")

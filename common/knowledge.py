@@ -5,12 +5,8 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from git import GitCommandError, InvalidGitRepositoryError, Repo
-
 from odev.common.connectors import GitConnector
-from odev.common.console import console
 from odev.common.logging import logging
-from odev.common.version import OdooVersion
 
 
 if TYPE_CHECKING:
@@ -117,10 +113,9 @@ class KnowledgeIndex:
                 prompt_format="Fine-grained GitHub token:",
                 ask_missing=ask,
             )
-        except Exception:  # noqa: BLE001 - a missing or unreadable secret just means "not configured"
-            return None
-        else:
             return secret.password or None
+        except Exception:
+            return None
 
     def _save_token(self, token: str) -> None:
         """Persist the fine-grained token to the secrets store."""
@@ -147,6 +142,8 @@ class KnowledgeIndex:
         """
         if self.is_configured():
             return True
+
+        from odev.common.console import console
 
         console.rule("[bold color.cyan]⚡ Upgrade Knowledge Index — First-time Setup[/bold color.cyan]")
         console.print(
@@ -211,28 +208,6 @@ class KnowledgeIndex:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _has_migration_script(upgrade_path: Path, module: str, step_from: str) -> bool:
-        """Return True if the module ships a migration script for the given source version.
-
-        Odoo upgrade paths look like ``migrations/<module>/<src_version>.*``.
-        """
-        if "saas" in step_from:
-            # saas-17.1 -> saas~17.1 (matches 10.saas~17.1.x or saas~17.1.x)
-            ov = OdooVersion(step_from)
-            pattern = f"saas~{ov.major}.{ov.minor}"
-        else:
-            # 17.0 -> 17.0.*
-            pattern = step_from
-
-        mod_mig_dir = upgrade_path / "migrations" / module
-        if not mod_mig_dir.exists():
-            return False
-        return any(
-            entry.is_dir() and (pattern in entry.name if "saas" in step_from else entry.name.startswith(pattern))
-            for entry in mod_mig_dir.iterdir()
-        )
-
-    @staticmethod
     def get_version_pairs(
         from_ver: str,
         to_ver: str,
@@ -248,6 +223,8 @@ class KnowledgeIndex:
 
         :returns: ``{module_name: [(from, to), ...]}``
         """
+        from odev.common.version import OdooVersion
+
         start_ov = OdooVersion(from_ver)
         end_ov = OdooVersion(to_ver)
 
@@ -281,7 +258,26 @@ class KnowledgeIndex:
             current_from = str(start_ov)
 
             for step_from, step_to in global_steps:
-                has_script = KnowledgeIndex._has_migration_script(upgrade_path, mod, step_from)
+                # Check if this module has a migration script for this jump
+                # Odoo upgrade paths: migrations/<module>/<src_version>.*
+                # We check for directories matching the version pattern
+                if "saas" in step_from:
+                    # saas-17.1 -> saas~17.1 (matches 10.saas~17.1.x or saas~17.1.x)
+                    ov = OdooVersion(step_from)
+                    pattern = f"saas~{ov.major}.{ov.minor}"
+                else:
+                    # 17.0 -> 17.0.*
+                    pattern = f"{step_from}"
+
+                mod_mig_dir = upgrade_path / "migrations" / mod
+                has_script = False
+                if mod_mig_dir.exists():
+                    for entry in mod_mig_dir.iterdir():
+                        if entry.is_dir() and (
+                            pattern in entry.name if "saas" in step_from else entry.name.startswith(pattern)
+                        ):
+                            has_script = True
+                            break
 
                 # We always include major version jumps to ensure continuity
                 is_major_jump = OdooVersion(step_to).major > OdooVersion(step_from).major
@@ -464,6 +460,8 @@ class KnowledgeIndex:
         if not sections:
             return ""
 
+        from odev.common.version import OdooVersion
+
         sorted_pairs = sorted(sections.keys(), key=lambda x: OdooVersion(x[0]))
 
         formatted_sections = []
@@ -496,6 +494,8 @@ class KnowledgeIndex:
         Uses the fine-grained token stored in odev secrets to authenticate the push.
         Returns the PR URL on success, or None if there was nothing to commit.
         """
+        from git import GitCommandError, InvalidGitRepositoryError, Repo
+
         local_path = self.local_path
         token = self._get_token()
         repo_url = self._knowledge_config.repo_url
@@ -549,10 +549,7 @@ class KnowledgeIndex:
     ) -> str | None:
         """Open a Pull Request using PyGitHub."""
         try:
-            from github import (  # noqa: PLC0415 - PyGitHub is an optional, undeclared dependency
-                Auth as GithubAuth,
-                Github,
-            )
+            from github import Auth as GithubAuth, Github
 
             # Extract org/repo slug from URL
             slug = re.sub(r"(https://[^/]+/|git@[^:]+:)", "", repo_url).removesuffix(".git")
@@ -570,9 +567,8 @@ class KnowledgeIndex:
                 head=branch_name,
                 base=gh_repo.default_branch,
             )
-        except Exception as e:  # noqa: BLE001 - PyGitHub surfaces network and API errors as many types
-            logger.error(f"Failed to open knowledge PR: {e}")
-            return None
-        else:
             logger.info(f"Knowledge PR created: {pr.html_url}")
             return pr.html_url
+        except Exception as e:
+            logger.error(f"Failed to open knowledge PR: {e}")
+            return None
