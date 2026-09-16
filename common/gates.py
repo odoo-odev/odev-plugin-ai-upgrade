@@ -48,27 +48,32 @@ def gutted_overrides(before: str, after: str) -> list[str]:
     that keeps the signature and the docstring while dropping the behaviour, which
     installs clean and passes tests.
     """
-    old, new = _function_bodies(before), _function_bodies(after)
+    new = _function_bodies(after)
     if new is None:
         return ["file no longer parses as Python"]
+    old = _function_bodies(before)
     if old is None:
         return []
 
     findings = []
-    for name, definitions in new.items():
+    for name, definition in new.items():
         previous = old.get(name)
-        # A name defined twice (a property and its setter, an @overload stub) is
-        # skipped rather than guessed at.
-        if not previous or len(definitions) != 1 or len(previous) != 1:
+        # ``None`` marks a name defined more than once, which is skipped rather
+        # than guessed at.
+        if definition is None or previous is None:
             continue
-        (length, is_stub), (was_length, was_stub) = definitions[0], previous[0]
+        (length, is_stub), (was_length, was_stub) = definition, previous
         if is_stub and not was_stub:
             findings.append(f"{name}: body reduced to a bare super() call ({was_length} -> {length})")
     return findings
 
 
-def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
-    """Map a qualified function name to every (statement count, is-a-stub) it has.
+def _function_bodies(source: str) -> dict[str, tuple[int, bool] | None] | None:
+    """Map a qualified function name to its (statement count, is-a-stub).
+
+    A name defined more than once - a property and its setter, an ``@overload``
+    stub - maps to ``None``: which definition is which cannot be told apart here,
+    so the caller skips it instead of guessing.
 
     Returns ``None`` when the source does not parse, which is itself worth
     reporting. Docstrings are ignored so documentation cannot mask an empty body.
@@ -78,7 +83,7 @@ def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
     except (SyntaxError, ValueError):
         return None
 
-    bodies: dict[str, list[tuple[int, bool]]] = {}
+    bodies: dict[str, tuple[int, bool] | None] = {}
     scope: list[str] = []
 
     def visit(node: ast.AST) -> None:
@@ -91,7 +96,7 @@ def _function_bodies(source: str) -> dict[str, list[tuple[int, bool]]] | None:
                         if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant))
                     ]
                     name = ".".join([*scope, child.name])
-                    bodies.setdefault(name, []).append((len(body), _is_stub(body)))
+                    bodies[name] = None if name in bodies else (len(body), _is_stub(body))
                 scope.append(child.name)
                 visit(child)
                 scope.pop()
@@ -139,13 +144,11 @@ def _is_lone_stub(statement: ast.stmt) -> bool:
 def _assigns_super_then_returns_it(body: list[ast.stmt]) -> bool:
     """Whether the body is `res = super().x(...)` then `return res`."""
     assign, returned = body
-    targets = getattr(assign, "targets", None)
-    return bool(
+    return (
         isinstance(assign, ast.Assign)
         and _calls_super(assign.value)
         and isinstance(returned, ast.Return)
         and isinstance(returned.value, ast.Name)
-        and targets
-        and isinstance(targets[0], ast.Name)
-        and targets[0].id == returned.value.id
+        and isinstance(assign.targets[0], ast.Name)
+        and assign.targets[0].id == returned.value.id
     )
