@@ -21,7 +21,6 @@ from odev.common.mixins.databases.list import ListLocalDatabasesMixin
 from odev.common.odoobin import (
     ODOO_COMMUNITY_REPOSITORIES,
     ODOO_ENTERPRISE_REPOSITORIES,
-    ODOO_UPGRADE_REPOSITORY,
     OdoobinProcess,
 )
 from odev.common.store.datastore import DataStore
@@ -312,20 +311,19 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         project_path = Path(self.args.path).resolve()
         worktrees_path = self.odev.worktrees_path.resolve()
         venvs_path = self.odev.venvs_path.resolve()
-        upgrade_path = self.config.paths.upgrade.resolve()
 
         target_db, sandbox_dirs, extra_bind_dirs = self._get_sandbox_config(
             target_ver, project_path, worktrees_path, venvs_path
         )
         modules_info = self._get_modules_info()
 
-        upgrade_instructions = self._setup_upgrade_instructions(upgrade_path, extra_bind_dirs)
+        upgrade_instructions = self._setup_upgrade_instructions(extra_bind_dirs)
         from_odoo_path = (
             str(worktrees_path / from_ver) if (worktrees_path / from_ver).exists() else f"Virtual ({from_ver})"
         )
         target_odoo_path = str(worktrees_path / target_ver)
 
-        ki, knowledge_local_path = self._setup_knowledge_index_context(modules_info, from_ver, target_ver, upgrade_path)
+        ki, knowledge_local_path = self._setup_knowledge_index_context(modules_info, from_ver, target_ver)
         if knowledge_local_path:
             sandbox_dirs.append(knowledge_local_path)
 
@@ -357,30 +355,20 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             modules_info,
         )
 
-    def _setup_upgrade_instructions(self, upgrade_path: Path, extra_bind_dirs: list[str]) -> str:
-        """Manage Odoo Upgrade repository and return instructions for AI."""
-        upgrade_connector = GitConnector(ODOO_UPGRADE_REPOSITORY, path=upgrade_path)
-        with progress.spinner(f"Managing {ODOO_UPGRADE_REPOSITORY!r} repository"):
-            if not upgrade_connector.exists:
-                upgrade_connector.clone()
-            else:
-                upgrade_connector.pull(force=True)
-            extra_bind_dirs.append(str(upgrade_path))
+    def _setup_upgrade_instructions(self, extra_bind_dirs: list[str]) -> str:
+        """Return extra migration sources to hand to the AI, none by default.
 
-        return (
-            f"\n- **Migration Scripts (Upgrade Repository)**: You have access to the official Odoo Enterprise "
-            f"migration scripts at `{upgrade_path}`. This repository contains the logic used by Odoo's upgrade team. "
-            "You MUST search this directory to understand how Odoo handles API changes, field renames, and model "
-            "migrations for the modules you are upgrading. Use `grep` or `git grep` within this directory "
-            "to find mentions of your module or specific fields/methods that have changed."
-        )
+        Override to point the agent at more migration material: append the directories
+        it needs to ``extra_bind_dirs`` so the sandbox mounts them, and return the prompt
+        text describing them.
+        """
+        return ""
 
     def _setup_knowledge_index_context(
         self,
         modules_info: list[dict],
         from_ver: str,
         target_ver: str,
-        upgrade_path: Path,
     ) -> tuple["KnowledgeIndex | None", str | None]:
         """Setup KnowledgeIndex."""
         from odev.plugins.odev_plugin_ai_upgrade.common.knowledge import (  # noqa: PLC0415 - avoid a circular import
