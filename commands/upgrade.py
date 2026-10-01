@@ -4,14 +4,15 @@ import ast
 import re
 import shutil
 import subprocess
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import jinja2
 import networkx as nx
-from git import Repo
+from git import BadName, Blob, GitCommandError, Repo
 
-from odev.common import args, progress
+from odev.common import args, progress, string
 from odev.common.commands import DatabaseCommand
 from odev.common.connectors import GitConnector
 from odev.common.console import console
@@ -27,6 +28,7 @@ from odev.common.store.datastore import DataStore
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
+from odev.plugins.odev_plugin_ai_upgrade.common.gates import gutted_overrides, iter_cited_shas
 
 
 if TYPE_CHECKING:
@@ -34,6 +36,14 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# The repositories a `Source:` trailer can cite, mapped to the clone they live in.
+# One source of truth: the citation gate resolves against these, and the coverage
+# notes report the ones with no provisioned worktree.
+CITED_REPOSITORIES: dict[str, str] = {
+    "odoo": ODOO_COMMUNITY_REPOSITORIES[0],
+    "enterprise": ODOO_ENTERPRISE_REPOSITORIES[0],
+}
 
 # Above this many lines in `ruff check --diff`, auto-linting would drown the git diff.
 NOISY_RUFF_DIFF_LINES = 50
@@ -93,6 +103,12 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
     no_ruff = args.Flag(
         aliases=["--no-ruff"],
         description="Don't instruct the AI to run ruff check --fix after edits.",
+        default=False,
+    )
+
+    strict_gates = args.Flag(
+        aliases=["--strict-gates"],
+        description="Fail the run when a post-flight gate reports a finding, instead of warning.",
         default=False,
     )
 
@@ -502,6 +518,8 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             _modules_info,
         ) = prepared
         self._target_db = target_db
+        project = GitConnector(str(repo_path))
+        base_sha = self._head_sha(project)
         agent = self.get_ai_agent()
 
         self._cleanup_wizard(stage="pre-flight", exclude=[target_db])
@@ -523,6 +541,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         ):
             return
 
+        self._post_flight_gates(project, base_sha, target_ver)
         self._sync_knowledge(ki, from_ver, target_ver)
 
     def _get_upgrade_databases(self) -> list[str]:
@@ -553,6 +572,137 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
             if db.exists:
                 logger.info(f"Dropping database {db_name!r}...")
                 db.drop()
+
+    @staticmethod
+    def _head_sha(project: "GitConnector") -> str | None:
+        """Return the commit the project is on, or ``None`` when it has no usable repository."""
+        repository = project.repository
+        return repository.head.commit.hexsha if repository and repository.head.is_valid() else None
+
+    def _target_worktrees(self, target_ver: str) -> dict[str, "Repo"]:
+        """Return the provisioned Odoo checkouts for ``target_ver``, keyed by repository.
+
+        Uses ``GitConnector.worktrees()`` rather than assuming a directory layout:
+        a version directory holds one checkout per repository, not a repository.
+        """
+        found: dict[str, Repo] = {}
+        for repo, name in CITED_REPOSITORIES.items():
+            for worktree in GitConnector(name).worktrees():
+                if worktree.name == target_ver:
+                    found[repo] = worktree.repository
+                    break
+        return found
+
+    def _gate_source_shas(self, repository: "Repo", base_sha: str, worktrees: dict[str, "Repo"]) -> list[str]:
+        """Every ``Source:`` SHA must resolve in a provisioned worktree.
+
+        A citation that cannot be resolved moves the verification cost to the
+        reviewer without saying so.
+        """
+        findings: list[str] = []
+        for commit in repository.iter_commits(f"{base_sha}..HEAD"):
+            for repo, cited in iter_cited_shas(commit.message):
+                # Most citations name no repository, and the ones that do are not
+                # always right, so accept the commit from any provisioned checkout:
+                # the question is whether it exists in the Odoo source, not where.
+                candidates = [worktrees[repo]] if repo in worktrees else list(worktrees.values())
+                if not candidates:
+                    continue  # reported once by _coverage_notes, not per citation
+                if not any(self._commit_exists(target, cited) for target in candidates):
+                    # An ambiguous abbreviation also fails to resolve, so no
+                    # separate length rule is applied: valid citations are
+                    # frequently abbreviated.
+                    where = repo or "/".join(sorted(worktrees))
+                    findings.append(f"{commit.hexsha[:8]} cites {cited} ({where}): does not resolve")
+
+        return findings
+
+    @staticmethod
+    def _commit_exists(repository: "Repo", sha: str) -> bool:
+        try:
+            repository.commit(sha)
+        except (ValueError, BadName, GitCommandError):
+            return False
+        return True
+
+    @staticmethod
+    def _blob_text(blob: "Blob") -> str:
+        """Read a blob, replacing undecodable bytes: one legacy-encoded file must not disable a gate."""
+        return blob.data_stream.read().decode("utf-8", errors="replace")
+
+    def _gate_gutted_overrides(self, repository: "Repo", base_sha: str) -> list[str]:
+        """Flag overrides reduced to a bare ``super()`` call.
+
+        Deleting an obsolete override is correct; leaving a stub that keeps the
+        signature while dropping the body silently removes behaviour.
+        """
+        base, head = repository.commit(base_sha), repository.commit("HEAD")
+        findings: list[str] = []
+        # Rename detection is on by default, so a moved file is still compared against
+        # its source instead of reading as newly added. A missing blob means the run
+        # added or deleted the file, which leaves nothing to compare.
+        for change in base.diff(head):
+            if change.a_blob is None or change.b_blob is None or not change.b_path.endswith(".py"):
+                continue
+            before, after = self._blob_text(change.a_blob), self._blob_text(change.b_blob)
+            findings.extend(f"{change.b_path}::{finding}" for finding in gutted_overrides(before, after))
+        return findings
+
+    def _post_flight_gates(self, project: "GitConnector", base_sha: str | None, target_ver: str) -> None:
+        """Report on the run's own commits. Reads git only; needs no database."""
+        repository = project.repository
+        if repository is None or not base_sha:
+            logger.warning(f"Post-flight checks skipped: could not resolve the pre-run HEAD of {project.path}.")
+            return
+
+        worktrees = self._target_worktrees(target_ver)
+        notes: list[str] = self._coverage_notes(project, base_sha, target_ver, worktrees)
+        findings: list[str] = []
+        with progress.spinner("Running post-flight checks"):
+            # Bound at the call site so each gate takes only what it needs, and so a
+            # failure is reported by name rather than by private method.
+            for label, gate in (
+                ("Source: citations", partial(self._gate_source_shas, repository, base_sha, worktrees)),
+                ("gutted overrides", partial(self._gate_gutted_overrides, repository, base_sha)),
+            ):
+                try:
+                    findings.extend(gate())
+                except Exception as e:  # noqa: BLE001 - a broken check must not abort the run
+                    notes.append(f"the {label} check did not complete: {e}")
+
+        if notes:
+            # A gap in the environment is not a defect in the run, so it never trips
+            # --strict-gates - but it must not read as a clean pass either.
+            logger.warning(f"Not checked:\n{string.join_bullet(notes)}")
+
+        if not findings:
+            logger.info("Post-flight checks passed." if not notes else "Post-flight checks passed, with gaps above.")
+            return
+
+        message = f"{len(findings)} post-flight finding(s):\n{string.join_bullet(findings)}"
+        if self.args.strict_gates:
+            # Before the knowledge sync on purpose: that harvests `Source:` SHAs, and an
+            # unresolvable citation must not reach the knowledge base.
+            raise self.error(f"{message}\nKnowledge sync skipped. Re-run without --strict-gates to sync anyway.")
+        logger.warning(message)
+
+    def _coverage_notes(
+        self, project: "GitConnector", base_sha: str, target_ver: str, worktrees: dict[str, "Repo"]
+    ) -> list[str]:
+        """State what the gates could not look at, so a pass is never mistaken for coverage."""
+        notes: list[str] = []
+
+        if self._head_sha(project) == base_sha:
+            notes.append("the run produced no commits, so nothing was inspected")
+        if project.is_dirty:
+            notes.append("uncommitted changes are present and were not inspected (gates read committed state only)")
+
+        missing = sorted(CITED_REPOSITORIES.keys() - worktrees.keys())
+        if missing:
+            notes.append(f"citations against {', '.join(missing)} could not be checked: no worktree for {target_ver}")
+        if self.args.submodules:
+            notes.append("submodule contents were not inspected: the parent repository records only a gitlink")
+        return notes
 
     def _check_ruff_cleanliness(self, repo_path: Path):
         """Check if the module has many linting errors before starting."""
