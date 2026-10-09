@@ -49,6 +49,16 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
     _database_arg_required = False
     _target_db: str | None = None
 
+    # Declared here like the other AI commands do, so the skills the prompt sends the agent to
+    # (`templates/upgrade_prompt.md.j2`) are installed with the shared ones, `odev` among them.
+    required_skills = [
+        *AICommandMixin.required_skills,
+        "odoo-commit-message-guidelines",
+        "odoo_upgrade_utils",
+        "custom_util",
+        "odoo_upgrade_skill",
+    ]
+
     path = args.Path(
         aliases=["--path"],
         description="Path to the module directory. Defaults to the current directory.",
@@ -508,10 +518,7 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         logger.info(f"Starting Project-wide AI Upgrade: from {from_ver} to {target_ver} ({target_db})")
 
-        self._ensure_skills(
-            ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"],
-            handler=agent.handler,
-        )
+        self._ensure_skills(self.required_skills, handler=agent.handler)
 
         if not agent.run(
             prompt,
