@@ -16,6 +16,7 @@ from odev.common.commands import DatabaseCommand
 from odev.common.connectors import GitConnector
 from odev.common.console import console
 from odev.common.databases import LocalDatabase
+from odev.common.errors import ConnectorError
 from odev.common.logging import logging
 from odev.common.mixins.databases.list import ListLocalDatabasesMixin
 from odev.common.odoobin import (
@@ -358,14 +359,24 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
         )
 
     def _setup_upgrade_instructions(self, upgrade_path: Path, extra_bind_dirs: list[str]) -> str:
-        """Manage Odoo Upgrade repository and return instructions for AI."""
+        """Manage Odoo Upgrade repository and return instructions for AI, or nothing when it is unavailable."""
         upgrade_connector = GitConnector(ODOO_UPGRADE_REPOSITORY, path=upgrade_path)
         with progress.spinner(f"Managing {ODOO_UPGRADE_REPOSITORY!r} repository"):
-            if not upgrade_connector.exists:
-                upgrade_connector.clone()
-            else:
-                upgrade_connector.pull(force=True)
-            extra_bind_dirs.append(str(upgrade_path))
+            try:
+                if not upgrade_connector.exists:
+                    upgrade_connector.clone()
+                else:
+                    upgrade_connector.pull(force=True)
+            except ConnectorError as e:
+                # The repository is private to Odoo: partners and community users cannot clone it.
+                # A checkout that only failed to update is still worth reading, the check below decides.
+                logger.warning(str(e))
+
+        if not upgrade_connector.exists:
+            logger.warning(f"No repository found at {upgrade_path}. Proceeding without the migration scripts.")
+            return ""
+
+        extra_bind_dirs.append(str(upgrade_path))
 
         return (
             f"\n- **Migration Scripts (Upgrade Repository)**: You have access to the official Odoo Enterprise "
