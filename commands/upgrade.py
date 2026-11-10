@@ -27,6 +27,7 @@ from odev.common.store.datastore import DataStore
 from odev.common.utils import EmployeeUtils
 
 from odev.plugins.odev_plugin_ai.common.mixins import AICommandMixin
+from odev.plugins.odev_plugin_ai.common.skills import ensure_skills
 
 
 if TYPE_CHECKING:
@@ -508,9 +509,14 @@ class UpgradeCommand(DatabaseCommand, ListLocalDatabasesMixin, AICommandMixin):
 
         logger.info(f"Starting Project-wide AI Upgrade: from {from_ver} to {target_ver} ({target_db})")
 
-        self._ensure_skills(
+        # The migrated code is written for, and runs on, the target version: its source skills
+        # are the ones to add next to the shared upgrade ones.
+        agent.handler.ensure_skills_discoverable()
+        ensure_skills(
+            self.odev,
+            self.config,
             ["odoo_upgrade_utils", "custom_util", "odoo_upgrade_skill"],
-            handler=agent.handler,
+            version=target_ver,
         )
 
         if not agent.run(
